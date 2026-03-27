@@ -26,7 +26,7 @@ Example pipeline:
 import sys
 import time
 import logging
-from pyocd.probe.aggregator import DebugProbeAggregator
+from pyocd.core.helpers import ConnectHelper
 
 
 def setup_logging():
@@ -42,21 +42,29 @@ def setup_logging():
 def find_and_connect(log):
     """Find and connect to STM32 via ST-Link."""
     log.info("Scanning for ST-Link probes...")
-    aggregator = DebugProbeAggregator()
-    probes = aggregator.get_probes()
-
+    probes = ConnectHelper.get_all_connected_probes(blocking=False)
     if not probes:
         log.error("No ST-Link probes found. Check USB connection.")
         sys.exit(1)
 
     probe = probes[0]
-    log.info(f"Found probe: {probe.product_name} (Serial: {probe.serial_number})")
+    probe_name = getattr(probe, "product_name", getattr(probe, "description", "Unknown probe"))
+    probe_sn = getattr(probe, "serial_number", "unknown")
+    log.info(f"Found probe: {probe_name} (Serial: {probe_sn})")
 
-    probe.open()
-    session = probe.session
+    # Create a proper pyOCD session with the first connected probe.
+    session = ConnectHelper.session_with_chosen_probe(
+        blocking=False,
+        return_first=True,
+    )
+    if session is None:
+        raise RuntimeError("Failed to create pyOCD session")
+
+    session.open()
     target = session.target
 
-    log.info(f"Connected to {target.part_number}")
+    target_name = getattr(target, "part_number", getattr(target, "name", "unknown target"))
+    log.info(f"Connected to {target_name}")
     log.info("Halting target to access RTT buffer...")
 
     target.halt()
@@ -78,24 +86,22 @@ def read_rtt_buffer(session, max_retries=5):
     """
     log = logging.getLogger(__name__)
 
-    # Try to find RTT control block
-    # Magic number for RTT is 0x19681122 ("SEGGER RTT" string follows)
-    rtt_magic = 0x19681122
+    # Find RTT control block by SEGGER ID string at acID[16].
+    rtt_id = b"SEGGER RTT"
     base_addr = 0x20000000
-    search_size = 0x10000  # Search first 64KB of SRAM
+    search_size = 0x18000  # Search first 96KB of SRAM1 (0x20000000-0x20017FFF)
 
     log.info("Searching for RTT control block...")
 
     for attempt in range(max_retries):
         try:
-            # Read chunk and search for magic
-            data = session.target.read_memory_block32(base_addr, search_size // 4)
-
-            for i, word in enumerate(data):
-                if word == rtt_magic:
-                    rtt_addr = base_addr + (i * 4)
-                    log.info(f"Found RTT control block at 0x{rtt_addr:08x}")
-                    return rtt_addr
+            # Read raw bytes and search for control block ID string.
+            data = bytes(session.target.read_memory_block8(base_addr, search_size))
+            idx = data.find(rtt_id)
+            if idx >= 0:
+                rtt_addr = base_addr + idx
+                log.info(f"Found RTT control block at 0x{rtt_addr:08x}")
+                return rtt_addr
 
             time.sleep(0.5)
 
@@ -114,31 +120,59 @@ def stream_rtt_data(session, rtt_addr):
     log.info("Press Ctrl+C to stop.\n")
 
     target = session.target
-    last_pos = 0
-    buf_size = 1024
 
-    # RTT buffer structure offsets (from SEGGER_RTT.c)
-    # Control block + Up buffers array
-    # Up buffer 0 offset in CB
-    buffer_ptr_offset = 48  # Approximate offset to pBuffer field
+    # Layout from this project's SEGGER_RTT.c on Cortex-M:
+    # SEGGER_RTT_CB:
+    #   +0  : acID[16]
+    #   +16 : MaxNumUpBuffers (u32)
+    #   +20 : MaxNumDownBuffers (u32)
+    #   +24 : aUp[0].pBuffer (u32 ptr)
+    #   +28 : aUp[0].BufferSize (u32)
+    #   +32 : aUp[0].Pos (u32)
+    up_pbuffer_off = 24
+    up_size_off = 28
+    up_pos_off = 32
+
+    def read_u32(addr):
+        return target.read_memory_block32(addr, 1)[0]
+
+    up_buf_addr = read_u32(rtt_addr + up_pbuffer_off)
+    up_buf_size = read_u32(rtt_addr + up_size_off)
+    last_pos = read_u32(rtt_addr + up_pos_off)
+
+    if up_buf_addr == 0 or up_buf_size == 0:
+        log.error("RTT up-buffer is not initialized yet")
+        return
+
+    log.info(f"RTT up-buffer at 0x{up_buf_addr:08x}, size={up_buf_size}")
 
     try:
         while True:
             try:
-                # Read RTT up buffer(data structure (simplified polling)
-                # In real impl would read actual ringbuffer pos/pBuffer
-                # For now, just keep connection alive
-                time.sleep(0.1)
+                time.sleep(0.02)
+                pos = read_u32(rtt_addr + up_pos_off)
 
-                # Attempt to read current position in RTT buffer
-                try:
-                    # Read control block position field
-                    pos_data = target.read_memory_block8(
-                        rtt_addr + buffer_ptr_offset, 4
-                    )
-                    # Note: This is simplified; real RTT parsing is more complex
-                except:
-                    pass
+                if pos == last_pos:
+                    continue
+
+                if pos > up_buf_size:
+                    log.warning(f"Invalid RTT position {pos}, resetting read pointer")
+                    last_pos = 0
+                    continue
+
+                if pos > last_pos:
+                    chunk = bytes(target.read_memory_block8(up_buf_addr + last_pos, pos - last_pos))
+                else:
+                    # Wrap-around in circular buffer.
+                    chunk1 = bytes(target.read_memory_block8(up_buf_addr + last_pos, up_buf_size - last_pos))
+                    chunk2 = bytes(target.read_memory_block8(up_buf_addr, pos))
+                    chunk = chunk1 + chunk2
+
+                if chunk:
+                    sys.stdout.write(chunk.decode("utf-8", errors="ignore"))
+                    sys.stdout.flush()
+
+                last_pos = pos
 
             except KeyboardInterrupt:
                 raise

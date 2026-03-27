@@ -90,8 +90,8 @@ def main():
     ax_gyro.legend(loc="upper right")
     ax_gyro.grid(True)
 
-    # Line reader state
-    reader_state = {"first_update": True}
+    # Monotonic sample counter for x-axis progression.
+    sample_index = {"value": 0}
 
     def on_new_data(line_data):
         """Called when new data arrives from stdin."""
@@ -101,14 +101,15 @@ def main():
 
         t_ms, ax, ay, az, gx, gy, gz = parsed
 
-        # Append to buffers
-        data["t"].append(len(data["t"]))  # Use sample index as x-axis
+        # Append to buffers using a monotonic x-axis index.
+        data["t"].append(sample_index["value"])
         data["ax"].append(ax)
         data["ay"].append(ay)
         data["az"].append(az)
         data["gx"].append(gx)
         data["gy"].append(gy)
         data["gz"].append(gz)
+        sample_index["value"] += 1
 
         # Log to CSV
         if csv_writer:
