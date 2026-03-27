@@ -1,0 +1,342 @@
+# Athlete Monitoring Prototype - Progress Tracker
+This project is a prototype lumbar-mounted athlete monitoring data logger for running fatigue detection, built on an STM32 Nucleo-L476RG with breakout sensors. The current stack is BMI270 IMU (I2C, target 200 Hz accel+gyro with FIFO watermark interrupt batching), BMP390 barometer (I2C, default 0x77 with fallback 0x76, low-rate pressure/elevation trend), and later u-blox MAX-10S GNSS for route context and precise time synchronization across future multi-node devices (for example lumbar + tibia units). Data is being structured now in a fixed, backward-compatible schema with a unified millisecond timestamp and status bitfield so Phase 1 (IMU-first) logs remain compatible when barometer, GNSS, and SD card logging are added. Current priorities are robust sensor initialization, timing discipline, FIFO/interrupt reliability, deterministic logging architecture, and validation tests (noise floor, clipping, drift, overflow, and long-run stability) before moving to post-processing fatigue features like step frequency, peak vertical acceleration, stride regularity, and dynamic stress load.
+
+## 1) Project Snapshot
+- Date: 26 Mar 2026
+- Current firmware branch:
+- Hardware setup in use:
+- Current objective (this week): Stabilize IMU polling path and add basic health telemetry before FIFO interrupt migration.
+- Current blocker(s): None critical for IMU polling; FIFO watermark interrupt path still pending.
+- Next unblock date (expected): N/A
+
+---
+
+## 2) System Goal (Frozen)
+Build a lumbar-mounted athlete monitoring data logger for running-focused fatigue analysis, combining:
+- BMI270 IMU (biomechanics)
+- BMP390 barometer (terrain gradient context)
+- u-blox MAX-10S GNSS (route + absolute timing + multi-device sync)
+- SD logging over SPI (primary storage)
+
+Primary use:
+- Post-process synchronized data to detect fatigue onset and progression.
+- Later support multi-node setups (e.g., lumbar + tibia units) with GNSS time alignment.
+
+---
+
+## 3) Hardware Inventory and Status
+
+## 3.1 MCU / Core
+- [ ] Nucleo-L476RG bring-up stable
+- [ ] Clock config verified
+- [ ] UART debug stable at target baud
+- [ ] I2C @ 400 kHz stable
+- [ ] SPI for SD validated (when reader arrives)
+
+Notes:
+
+## 3.2 IMU (BMI270 - SparkFun, I2C)
+- Address used:
+- INT pin wired to:
+- Status:
+  - [ ] Detected
+  - [ ] Init sequence validated
+  - [ ] Accel+gyro enabled
+  - [ ] FIFO watermark interrupt working
+  - [ ] Burst read + frame parse stable
+
+Notes:
+
+## 3.3 Barometer (BMP390 - Adafruit, I2C)
+- Address found:
+  - [ ] 0x77
+  - [ ] 0x76
+- Status:
+  - [ ] Detected
+  - [ ] Pressure/temperature reads stable
+  - [ ] ODR/oversampling/filter finalized
+  - [ ] Relative altitude calculation validated
+
+Notes:
+
+## 3.4 GNSS (u-blox MAX-10S)
+- Antenna adapter available:
+  - [ ] Yes
+  - [ ] No (blocked)
+- Status:
+  - [ ] UART link working
+  - [ ] NMEA/UBX parsing
+  - [ ] GPS week/TOW extracted
+  - [ ] 1PPS integration (if used)
+  - [ ] Time sync fields populated
+
+Notes:
+
+## 3.5 SD Logging
+- Reader available:
+  - [ ] Yes
+  - [ ] No (blocked)
+- Status:
+  - [ ] SPI electrical bring-up
+  - [ ] Filesystem init
+  - [ ] Log file write/flush strategy
+  - [ ] Sustained write-rate test
+  - [ ] Power-loss behavior tested
+
+Notes:
+
+---
+
+## 4) Frozen v1 Sensor Configuration
+
+## 4.1 BMI270 Target Config
+- Sampling:
+  - [ ] Accel ODR = 200 Hz
+  - [ ] Gyro ODR = 200 Hz
+- Ranges:
+  - [ ] Accel range = +-16 g (or note deviation)
+  - [ ] Gyro range = +-2000 dps
+- Performance mode:
+  - [ ] accel filter perf enabled
+  - [ ] gyro filter perf enabled
+- FIFO:
+  - [ ] Header mode enabled
+  - [ ] Accel+gyro frames enabled
+  - [ ] Watermark set (record exact bytes):
+- Interrupt:
+  - [ ] FIFO watermark mapped to INT pin
+  - [ ] EXTI callback sets event flag only
+  - [ ] Main loop performs burst read on flag
+- Safety:
+  - [ ] Overflow detection + status bit
+  - [ ] I2C error counters + status bits
+
+Current chosen watermark bytes:
+Reason for chosen watermark:
+
+## 4.2 BMI270 Init Sequence Validation
+- [ ] Power save disabled (`PWR_CONF`)
+- [ ] >=450 us delay respected
+- [ ] Config upload step complete (via Bosch API path or manual path)
+- [ ] Internal status confirms init complete
+- [ ] Sensor config + enable succeeds every boot
+
+Chosen init method:
+- [ ] Bosch SensorAPI init path
+- [ ] Manual register sequence
+Do not mix methods unless explicitly documented.
+
+## 4.3 BMP390 Target Config
+- ODR target:
+  - [ ] 1 Hz
+  - [ ] 10 Hz
+  - [ ] 25 Hz
+- Oversampling:
+  - [ ] Pressure x8
+  - [ ] Temperature x1
+- IIR filter:
+  - [ ] Coeff 3
+  - [ ] Coeff 4
+
+Final selection rationale:
+
+---
+
+## 5) Data Schema (Must Stay Backward Compatible)
+
+## 5.1 Unified CSV Header (Phase 1 and Phase 2)
+t_ms, ax_raw, ay_raw, az_raw, gx_raw, gy_raw, gz_raw, imu_temp_raw, pres_pa, baro_temp_c, gps_week, gps_tow_ms, gps_lat, gps_lon, gps_alt_mm, gps_fix, status
+
+- [ ] Implemented in firmware output
+- [ ] Verified by parser script
+- [ ] Placeholder policy documented (before GNSS/baro live)
+
+Placeholder policy before sensor ready:
+- GPS integer fields: 0 or -1 (choose one and freeze)
+- GPS floating fields: 0.0 or NaN text (choose one and freeze)
+
+Chosen policy:
+
+## 5.2 Status Bitfield (Frozen)
+- Bit 0: IMU OK
+- Bit 1: Baro OK
+- Bit 2: IMU I2C error
+- Bit 3: Baro I2C error
+- Bit 4: IMU FIFO overflow
+- Bit 5: IMU watermark timeout/missed IRQ
+- Bit 6: GNSS time valid
+- Bit 7: SD write fail
+
+- [ ] Implemented
+- [ ] Unit-tested in forced-fault mode
+
+---
+
+## 6) Firmware Architecture Checklist
+
+## 6.1 Tasking Model
+- [ ] Main loop non-blocking
+- [ ] IMU driven by FIFO watermark interrupt
+- [ ] Baro periodic task (timer/software counter)
+- [ ] Logging task decoupled from sensor read path
+- [ ] No long blocking prints in critical paths
+
+## 6.2 Timebase & Sync
+- [ ] `t_ms` from `HAL_GetTick()` on every record
+- [ ] GNSS time fields reserved and parsed later
+- [ ] Local-to-GNSS offset strategy documented
+- [ ] Multi-device sync assumptions documented
+
+## 6.3 Health Telemetry
+- [x] imu_read_ok count
+- [x] imu_read_err count
+- [ ] baro_read_ok count
+- [ ] baro_read_err count
+- [ ] fifo_overflow_count
+- [ ] max_loop_time_ms
+- [ ] max_imu_service_latency_ms
+
+Notes:
+- Implemented in polling mode as cumulative counters printed every 1 s over UART.
+- Counters increase inside the IMU task success/fail branches in main loop.
+
+---
+
+## 7) Bring-Up and Validation Tests
+
+## 7.1 IMU Functional Tests
+- [ ] Boot init repeatability (50 power cycles)
+- [ ] Static noise capture (60-120 s)
+- [ ] Axis sign/orientation check
+- [ ] Dynamic motion sanity check
+- [ ] Clipping check under expected impacts
+- [ ] FIFO overflow stress test
+
+Results summary:
+
+## 7.2 Timing and Throughput Tests
+- [ ] Watermark period observed ~expected
+- [ ] I2C transaction duration measured
+- [ ] CPU headroom acceptable
+- [ ] UART throughput not bottlenecking tests
+- [ ] (Later) SD sustained write test passes
+
+Measured values:
+- IMU service time (avg/max):
+- Watermark interval (avg/std):
+- FIFO overflow count over test:
+
+## 7.3 Barometer Tests
+- [ ] Pressure read stability static
+- [ ] Relative altitude drift over 10 min
+- [ ] Stair/uphill/downhill responsiveness
+- [ ] Filter setting comparison logged
+
+Results summary:
+
+## 7.4 Integration Tests
+- [ ] IMU + baro simultaneous logging stable
+- [ ] No data schema breaks across phases
+- [ ] Status bit behavior correct under induced faults
+- [ ] Long run test (>=45 min) without crash/data corruption
+
+Results summary:
+
+---
+
+## 8) Fatigue Feature Pipeline (Post-Processing)
+
+## 8.1 Priority Features
+- [ ] Step frequency (Z-axis peak or spectral approach)
+- [ ] Peak vertical acceleration per stride
+- [ ] Stride regularity (autocorrelation)
+- [ ] Dynamic Stress Load (DSL) with >2g threshold
+
+## 8.2 Feature Validation Plan
+- [ ] Controlled baseline run
+- [ ] Progressive fatigue protocol run
+- [ ] Compare early vs late segment feature drift
+- [ ] Repeatability across sessions checked
+
+## 8.3 Ground-Truth / Annotation
+- [ ] RPE captured (e.g., Borg scale)
+- [ ] Segment markers (warmup/steady/fatigue)
+- [ ] Terrain labels (flat/uphill/downhill)
+- [ ] Environmental notes (wind/temp/surface)
+
+---
+
+## 9) Risks, Assumptions, and Open Questions
+
+## 9.1 Known Risks
+- [ ] UART bottleneck at high sample throughput
+- [ ] I2C bus contention / timing jitter
+- [ ] FIFO near-capacity edge behavior
+- [ ] Barometric drift and weather effects
+- [ ] GNSS dropouts in challenging environments
+
+## 9.2 Assumptions
+- [ ] Lumbar placement gives sufficient fatigue sensitivity
+- [ ] 200 Hz captures required biomechanics
+- [ ] Post-processing can compensate for drift and context
+
+## 9.3 Open Questions
+- [ ] Final accel range: +-8 g vs +-16 g?
+- [ ] Need 1PPS now or later?
+- [ ] Binary log format needed before field trials?
+- [ ] Required battery/runtime target for v2?
+
+---
+
+## 10) Milestones and Exit Criteria
+
+## M0 - IMU Stable Logging
+- Exit criteria:
+  - [ ] 200 Hz accel+gyro from FIFO
+  - [ ] No overflows in 30 min bench run
+  - [ ] Unified CSV emitted with valid status bits
+
+## M1 - Terrain Context Added
+- Exit criteria:
+  - [ ] BMP390 integrated and logged
+  - [ ] Relative altitude trend validated in field walk/run
+
+## M2 - GNSS Time & Route Integration
+- Exit criteria:
+  - [ ] GPS week/TOW fields populated
+  - [ ] Route-linked fatigue analysis possible
+
+## M3 - SD Standalone Logger
+- Exit criteria:
+  - [ ] Reliable file writes through full session
+  - [ ] Data integrity validated after power cycles
+
+## M4 - First Fatigue Detection Prototype
+- Exit criteria:
+  - [ ] Four primary fatigue features extracted
+  - [ ] At least one reproducible fatigue onset marker observed
+
+Target dates:
+- M0:
+- M1:
+- M2:
+- M3:
+- M4:
+
+---
+
+## 11) Change Log (Keep This Updated)
+- YYYY-MM-DD:
+  - What changed:
+  - Why:
+  - Impact:
+  - Re-test required:
+
+---
+
+## 12) Immediate Next Actions (Rolling Top 5)
+1.
+2.
+3.
+4.
+5.

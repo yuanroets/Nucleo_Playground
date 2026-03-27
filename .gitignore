@@ -1,0 +1,12 @@
+build/
+venv/
+*.o
+*.a
+*.elf
+*.bin
+*.hex
+.vscode/
+*.pyc
+__pycache__/
+.DS_Store
+/tmp/
