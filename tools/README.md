@@ -1,39 +1,25 @@
-# IMU Live Plot + CSV Logger
+# RTT + Plotter Quick Start
 
-This folder contains a small host-side tool to visualize UART IMU data and log it to CSV.
+Use this when streaming data over SEGGER RTT and plotting live on your Mac.
 
-## 1) Firmware output format
-The STM32 firmware should print one line per sample in this format:
-
-`T,t_ms,ax,ay,az,gx,gy,gz`
-
-Example:
-
-`T,1234,-12,45,16320,0,0,0`
-
-Note: gyro may be placeholder zeros until gyro is enabled in firmware.
-
-## 2) Install dependencies (macOS)
-```bash
-python3 -m pip install pyserial matplotlib
+## 1) Activate venv (both terminals)
+```zsh
+source venv/bin/activate
 ```
 
-## 3) Find your serial port
-```bash
-ls /dev/tty.usb*
+## 2) Make temp file
+```zsh
+mkfifo /tmp/imu_stream 2>/dev/null
 ```
 
-## 4) Run tool
-```bash
-python3 tools/imu_live_plot_logger.py --port /dev/tty.usbmodemXXXX --baud 115200
+## 3) Start RTT capture (Terminal 1)
+From the project root:
+```zsh
+python3 tools/rtt_capture.py > /tmp/imu_stream 
 ```
 
-Optional args:
-- `--window 500` number of samples shown in plot window
-- `--interval-ms 50` plot refresh period
-- `--csv my_capture.csv` output filename
-
-## 5) Output
-- Live plot window with accel (top) and gyro (bottom)
-- CSV file in current working directory with columns:
-  `t_ms,ax_raw,ay_raw,az_raw,gx_raw,gy_raw,gz_raw`
+## 4) Start live plotter (Terminal 2)
+From the project root:
+```zsh
+cat /tmp/imu_stream | python3 tools/imu_live_plot_logger.py
+```

@@ -40,7 +40,13 @@ def parse_line(line):
 
 
 def main():
-    window_size = 300
+    # Visible time window in seconds for the scrolling plot.
+    window_seconds = 5.0
+    # Sampling rate from firmware configuration (BMI270 ODR 200 Hz).
+    sample_rate_hz = 200.0
+    # Number of samples to retain in the rolling window.
+    window_size = int(window_seconds * sample_rate_hz)
+
     update_interval = 50  # milliseconds
     csv_file = None
 
@@ -65,6 +71,10 @@ def main():
         "gz": deque(maxlen=window_size),
     }
 
+    # Conversion factor from raw accelerometer LSB to g-units.
+    # From firmware: ±16g maps to ~±32768 LSB -> 32768 / 16 = 2048 LSB per g.
+    acc_lsb_per_g = 2048.0
+
     # Setup matplotlib
     fig, axes = plt.subplots(2, 1, figsize=(12, 8))
     fig.suptitle("IMU Live Plot (6-Axis: Accel + Gyro)")
@@ -74,8 +84,8 @@ def main():
     (line_ax,) = ax_accel.plot([], [], label="ax", color="red")
     (line_ay,) = ax_accel.plot([], [], label="ay", color="green")
     (line_az,) = ax_accel.plot([], [], label="az", color="blue")
-    ax_accel.set_ylabel("Accel (LSB, ±16g)")
-    ax_accel.set_ylim(-40000, 40000)
+    ax_accel.set_ylabel("Accel (g, ±16g)")
+    ax_accel.set_ylim(-16.0, 16.0)
     ax_accel.legend(loc="upper right")
     ax_accel.grid(True)
 
@@ -84,14 +94,11 @@ def main():
     (line_gx,) = ax_gyro.plot([], [], label="gx", color="red")
     (line_gy,) = ax_gyro.plot([], [], label="gy", color="green")
     (line_gz,) = ax_gyro.plot([], [], label="gz", color="blue")
-    ax_gyro.set_xlabel("Sample Number")
+    ax_gyro.set_xlabel("Time (s)")
     ax_gyro.set_ylabel("Gyro (LSB, ±2000dps)")
     ax_gyro.set_ylim(-40000, 40000)
     ax_gyro.legend(loc="upper right")
     ax_gyro.grid(True)
-
-    # Monotonic sample counter for x-axis progression.
-    sample_index = {"value": 0}
 
     def on_new_data(line_data):
         """Called when new data arrives from stdin."""
@@ -101,15 +108,22 @@ def main():
 
         t_ms, ax, ay, az, gx, gy, gz = parsed
 
-        # Append to buffers using a monotonic x-axis index.
-        data["t"].append(sample_index["value"])
-        data["ax"].append(ax)
-        data["ay"].append(ay)
-        data["az"].append(az)
+        # Convert timestamp from milliseconds to seconds for real-time x-axis.
+        t_s = t_ms / 1000.0
+
+        # Convert accelerometer readings from raw LSB to g-units.
+        ax_g = ax / acc_lsb_per_g
+        ay_g = ay / acc_lsb_per_g
+        az_g = az / acc_lsb_per_g
+
+        # Append to buffers using real time (seconds) on the x-axis.
+        data["t"].append(t_s)
+        data["ax"].append(ax_g)
+        data["ay"].append(ay_g)
+        data["az"].append(az_g)
         data["gx"].append(gx)
         data["gy"].append(gy)
         data["gz"].append(gz)
-        sample_index["value"] += 1
 
         # Log to CSV
         if csv_writer:
@@ -132,11 +146,12 @@ def main():
         line_gy.set_data(x_data, list(data["gy"]))
         line_gz.set_data(x_data, list(data["gz"]))
 
-        # Auto-scale x-axis
+        # Auto-scale x-axis in time (seconds) with a sliding window.
         if len(x_data) > 0:
-            max_x = max(x_data)
-            ax_accel.set_xlim(max(0, max_x - window_size), max_x + 10)
-            ax_gyro.set_xlim(max(0, max_x - window_size), max_x + 10)
+            max_t = x_data[-1]
+            min_t = max(0.0, max_t - window_seconds)
+            ax_accel.set_xlim(min_t, max_t)
+            ax_gyro.set_xlim(min_t, max_t)
 
         return line_ax, line_ay, line_az, line_gx, line_gy, line_gz
 
@@ -158,7 +173,7 @@ def main():
 
     # Create animation
     ani = FuncAnimation(
-        fig, update_plot, interval=update_interval, blit=True, cache_frame_data=False
+        fig, update_plot, interval=update_interval, blit=False, cache_frame_data=False
     )
 
     print("Live IMU plot starting. Reading from stdin...", file=sys.stderr)

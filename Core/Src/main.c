@@ -23,6 +23,7 @@
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
 #include "bmi270.h"
+#include "bmp3.h"
 #include "SEGGER_RTT.h"
 
 /* USER CODE END Includes */
@@ -38,6 +39,8 @@
  * 200 Hz sampling = 5 ms per sample. Print every sample for live plotting.
  */
 #define IMU_VISUAL_REFRESH_MS 5U
+/* Barometer task period: 25 Hz output is enough for altitude/temperature trend. */
+#define BARO_VISUAL_REFRESH_MS 40U
 
 /* USER CODE END PD */
 
@@ -64,12 +67,17 @@ uint32_t last_blink_tick = 0;
 uint32_t last_button_tick = 0;
 /* Tick snapshot used to schedule IMU polling task. */
 uint32_t last_imu_tick = 0;
+/* Tick snapshot used to schedule BMP390 polling task. */
+uint32_t last_baro_tick = 0;
 /* Tick snapshot used to print low-rate IMU health telemetry. */
 uint32_t last_imu_stats_tick = 0;
 
 /* Simple health counters for IMU polling path. */
 uint32_t imu_read_ok_count = 0;
 uint32_t imu_read_err_count = 0;
+/* Simple health counters for barometer polling path. */
+uint32_t baro_read_ok_count = 0;
+uint32_t baro_read_err_count = 0;
 
 /* Bosch driver state object (callbacks, interface mode, internal status). */
 struct bmi2_dev bmi_dev;
@@ -86,6 +94,19 @@ typedef struct
 } bmi2_i2c_ctx_t;
 
 bmi2_i2c_ctx_t bmi2_i2c_ctx;
+
+/* Bosch BMP3 driver state object (BMP390 uses same BMP3 API). */
+struct bmp3_dev bmp_dev;
+/* Latest pressure/temperature sample from BMP390. */
+struct bmp3_data bmp_data = { 0 };
+
+typedef struct
+{
+  I2C_HandleTypeDef *hi2c;
+  uint16_t dev_addr;
+} bmp3_i2c_ctx_t;
+
+bmp3_i2c_ctx_t bmp3_i2c_ctx;
 
 /* USER CODE END PV */
 
@@ -104,6 +125,14 @@ static BMI2_INTF_RETURN_TYPE bmi2_i2c_write(uint8_t reg_addr,
                                             void *intf_ptr);
 static void bmi2_delay_us(uint32_t period, void *intf_ptr);
 static int8_t bmi270_basic_init(void);
+static BMP3_INTF_RET_TYPE bmp3_i2c_read(uint8_t reg_addr, uint8_t *reg_data, uint32_t len, void *intf_ptr);
+static BMP3_INTF_RET_TYPE bmp3_i2c_write(uint8_t reg_addr,
+                                         const uint8_t *reg_data,
+                                         uint32_t len,
+                                         void *intf_ptr);
+static void bmp3_delay_us(uint32_t period, void *intf_ptr);
+static uint8_t bmp390_detect_address(uint8_t *found_addr);
+static int8_t bmp390_basic_init(void);
 
 /* USER CODE END PFP */
 
@@ -235,6 +264,161 @@ static void bmi2_delay_us(uint32_t period, void *intf_ptr)
     /* NOP keeps one predictable instruction per iteration. */
     __NOP();
   }
+}
+
+/* Bosch BMP3 read callback: read bytes from BMP390 register space via I2C. */
+static BMP3_INTF_RET_TYPE bmp3_i2c_read(uint8_t reg_addr, uint8_t *reg_data, uint32_t len, void *intf_ptr)
+{
+  bmp3_i2c_ctx_t *ctx = (bmp3_i2c_ctx_t *) intf_ptr;
+  HAL_StatusTypeDef status;
+
+  if ((ctx == NULL) || (ctx->hi2c == NULL) || (reg_data == NULL) || (len == 0U))
+  {
+    return (BMP3_INTF_RET_TYPE) -1;
+  }
+
+  status = HAL_I2C_Mem_Read(ctx->hi2c,
+                            (uint16_t) (ctx->dev_addr << 1U),
+                            reg_addr,
+                            I2C_MEMADD_SIZE_8BIT,
+                            reg_data,
+                            (uint16_t) len,
+                            HAL_MAX_DELAY);
+
+  return (status == HAL_OK) ? BMP3_INTF_RET_SUCCESS : (BMP3_INTF_RET_TYPE) -1;
+}
+
+/* Bosch BMP3 write callback: write bytes to BMP390 register space via I2C. */
+static BMP3_INTF_RET_TYPE bmp3_i2c_write(uint8_t reg_addr,
+                                         const uint8_t *reg_data,
+                                         uint32_t len,
+                                         void *intf_ptr)
+{
+  bmp3_i2c_ctx_t *ctx = (bmp3_i2c_ctx_t *) intf_ptr;
+  HAL_StatusTypeDef status;
+
+  if ((ctx == NULL) || (ctx->hi2c == NULL) || (reg_data == NULL) || (len == 0U))
+  {
+    return (BMP3_INTF_RET_TYPE) -1;
+  }
+
+  status = HAL_I2C_Mem_Write(ctx->hi2c,
+                             (uint16_t) (ctx->dev_addr << 1U),
+                             reg_addr,
+                             I2C_MEMADD_SIZE_8BIT,
+                             (uint8_t *) reg_data,
+                             (uint16_t) len,
+                             HAL_MAX_DELAY);
+
+  return (status == HAL_OK) ? BMP3_INTF_RET_SUCCESS : (BMP3_INTF_RET_TYPE) -1;
+}
+
+/* BMP3 delay callback implemented with same busy-wait style as BMI270 path. */
+static void bmp3_delay_us(uint32_t period, void *intf_ptr)
+{
+  bmi2_delay_us(period, intf_ptr);
+}
+
+/* Probe both BMP390 I2C addresses so board strap variants work without code edits. */
+static uint8_t bmp390_detect_address(uint8_t *found_addr)
+{
+  uint8_t chip_id;
+  HAL_StatusTypeDef status;
+  uint8_t i;
+  const uint8_t candidate_addrs[2] = { BMP3_ADDR_I2C_SEC, BMP3_ADDR_I2C_PRIM };
+
+  if (found_addr == NULL)
+  {
+    return 0U;
+  }
+
+  for (i = 0U; i < 2U; i++)
+  {
+    status = HAL_I2C_Mem_Read(&hi2c2,
+                              (uint16_t) (candidate_addrs[i] << 1U),
+                              BMP3_REG_CHIP_ID,
+                              I2C_MEMADD_SIZE_8BIT,
+                              &chip_id,
+                              1U,
+                              50U);
+    if ((status == HAL_OK) && ((chip_id == BMP390_CHIP_ID) || (chip_id == BMP3_CHIP_ID)))
+    {
+      *found_addr = candidate_addrs[i];
+      return 1U;
+    }
+  }
+
+  return 0U;
+}
+
+/* Full BMP390 setup: pressure + temperature in normal mode over I2C2. */
+static int8_t bmp390_basic_init(void)
+{
+  int8_t rslt;
+  uint8_t detected_addr;
+  uint16_t desired_settings;
+  struct bmp3_settings bmp_settings;
+
+  if (!bmp390_detect_address(&detected_addr))
+  {
+    printf("BMP390 not detected on hi2c2 (tried 0x77 and 0x76)\r\n");
+    return (int8_t) -1;
+  }
+
+  bmp3_i2c_ctx.hi2c = &hi2c2;
+  bmp3_i2c_ctx.dev_addr = detected_addr;
+
+  bmp_dev.intf = BMP3_I2C_INTF;
+  bmp_dev.read = bmp3_i2c_read;
+  bmp_dev.write = bmp3_i2c_write;
+  bmp_dev.delay_us = bmp3_delay_us;
+  bmp_dev.intf_ptr = &bmp3_i2c_ctx;
+
+  rslt = bmp3_init(&bmp_dev);
+  if (rslt != BMP3_OK)
+  {
+    printf("BMP390 init failed: %d\r\n", rslt);
+    return rslt;
+  }
+
+  rslt = bmp3_get_sensor_settings(&bmp_settings, &bmp_dev);
+  if (rslt != BMP3_OK)
+  {
+    printf("BMP390 get cfg failed: %d\r\n", rslt);
+    return rslt;
+  }
+
+  bmp_settings.press_en = BMP3_ENABLE;
+  bmp_settings.temp_en = BMP3_ENABLE;
+  bmp_settings.odr_filter.press_os = BMP3_OVERSAMPLING_8X;
+  bmp_settings.odr_filter.temp_os = BMP3_OVERSAMPLING_2X;
+  bmp_settings.odr_filter.iir_filter = BMP3_IIR_FILTER_COEFF_3;
+  bmp_settings.odr_filter.odr = BMP3_ODR_25_HZ;
+
+  desired_settings = BMP3_SEL_PRESS_EN |
+                     BMP3_SEL_TEMP_EN |
+                     BMP3_SEL_PRESS_OS |
+                     BMP3_SEL_TEMP_OS |
+                     BMP3_SEL_IIR_FILTER |
+                     BMP3_SEL_ODR;
+
+  rslt = bmp3_set_sensor_settings((uint32_t) desired_settings, &bmp_settings, &bmp_dev);
+  if (rslt != BMP3_OK)
+  {
+    printf("BMP390 set cfg failed: %d\r\n", rslt);
+    return rslt;
+  }
+
+  bmp_settings.op_mode = BMP3_MODE_NORMAL;
+  rslt = bmp3_set_op_mode(&bmp_settings, &bmp_dev);
+  if (rslt != BMP3_OK)
+  {
+    printf("BMP390 set mode failed: %d\r\n", rslt);
+    return rslt;
+  }
+
+  printf("BMP390 ready, addr:0x%02X chip id:0x%02X\r\n", (unsigned int) detected_addr, (unsigned int) bmp_dev.chip_id);
+  return BMP3_OK;
 }
 
 /* Full BMI270 setup: accel + gyro at 200Hz for athlete monitoring. */
@@ -408,12 +592,19 @@ int main(void)
     Error_Handler();
   }
 
+  /* STEP E2: initialize BMP390 (Bosch BMP3 API) on I2C2 for pressure + temperature. */
+  if (bmp390_basic_init() != BMP3_OK)
+  {
+    Error_Handler();
+  }
+
   /* STEP F: set known initial state before entering endless loop.
    * Setting baseline ticks now avoids an immediate first-loop trigger.
    */
   HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
   last_blink_tick = HAL_GetTick();
   last_imu_tick = HAL_GetTick();
+  last_baro_tick = HAL_GetTick();
   last_imu_stats_tick = HAL_GetTick();
 
   /* USER CODE END 2 */
@@ -514,13 +705,41 @@ int main(void)
       }
     }
 
-    /* TASK 4: print low-rate IMU health summary once per second. */
+    /* TASK 4: periodically read BMP390 pressure+temperature and print compact CSV. */
+    if ((HAL_GetTick() - last_baro_tick) >= BARO_VISUAL_REFRESH_MS)
+    {
+      int8_t rslt;
+
+      last_baro_tick = HAL_GetTick();
+      rslt = bmp3_get_sensor_data(BMP3_PRESS_TEMP, &bmp_data, &bmp_dev);
+      if (rslt == BMP3_OK)
+      {
+        int32_t pressure_pa = (int32_t) (bmp_data.pressure);
+        int32_t temp_c_x100 = (int32_t) (bmp_data.temperature * 100.0);
+
+        baro_read_ok_count++;
+        /* CSV format: P,t_ms,pressure_pa,temp_c_x100 */
+        printf("P,%lu,%ld,%ld\r\n",
+               (unsigned long) HAL_GetTick(),
+               (long) pressure_pa,
+               (long) temp_c_x100);
+      }
+      else
+      {
+        baro_read_err_count++;
+        printf("BMP390 read failed: %d\r\n", rslt);
+      }
+    }
+
+    /* TASK 5: print low-rate sensor health summary once per second. */
     if ((HAL_GetTick() - last_imu_stats_tick) >= 1000U)
     {
       last_imu_stats_tick = HAL_GetTick();
-      printf("\r\nIMU stats ok:%lu err:%lu\r\n",
+      printf("\r\nIMU ok:%lu err:%lu | BARO ok:%lu err:%lu\r\n",
              (unsigned long) imu_read_ok_count,
-             (unsigned long) imu_read_err_count);
+             (unsigned long) imu_read_err_count,
+             (unsigned long) baro_read_ok_count,
+             (unsigned long) baro_read_err_count);
     }
   }
   /* USER CODE END 3 */

@@ -47,6 +47,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
     third_party/BMI270_SensorAPI/bmi2.c
     third_party/BMI270_SensorAPI/bmi270.c
+    third_party/BMP3_SensorAPI/bmp3.c
     third_party/SEGGER_RTT/SEGGER_RTT.c
 )
 
@@ -54,6 +55,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined include paths
     third_party/BMI270_SensorAPI
+    third_party/BMP3_SensorAPI
     third_party/SEGGER_RTT
 )
 

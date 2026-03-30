@@ -190,8 +190,8 @@ Chosen policy:
 ## 6.3 Health Telemetry
 - [x] imu_read_ok count
 - [x] imu_read_err count
-- [ ] baro_read_ok count
-- [ ] baro_read_err count
+- [x] baro_read_ok count
+- [x] baro_read_err count
 - [ ] fifo_overflow_count
 - [ ] max_loop_time_ms
 - [ ] max_imu_service_latency_ms
