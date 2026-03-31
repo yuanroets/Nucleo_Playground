@@ -1,26 +1,19 @@
 #!/usr/bin/env python3
-"""SEGGER RTT data capture from ST-Link using pyocd and pipe to IMU plotter.
+"""SEGGER RTT data capture from ST-Link using pyocd.
 
-This is the PREFERRED method for RTT capture on macOS.
+Reads RTT output from the STM32 and splits the stream:
+  - IMU lines  (prefix "T") -> stdout  -> piped into imu_live_plot_logger.py
+  - All other lines         -> stderr  -> printed in your terminal
+
+This means barometer readings (prefix "P"), boot messages, sensor health
+summaries, and any error lines all appear in the terminal while the plotter
+only receives the IMU CSV data it expects.
 
 Usage:
-    python3 tools/rtt_capture.py
+    python3 tools/rtt_capture.py | python3 tools/imu_live_plot_logger.py
 
 Prerequisites:
     pip install pyocd
-    
-The script will:
-1. Connect to STM32 via ST-Link
-2. Read RTT buffer in real-time
-3. Stream IMU data to stdout (format: T,t_ms,ax,ay,az,gx,gy,gz)
-4. Pipe output to your plotter: python3 tools/rtt_capture.py | live_plot.py
-
-Example pipeline:
-    # Terminal 1: Start RTT capture
-    python3 tools/rtt_capture.py > /tmp/imu_data.fifo &
-    
-    # Terminal 2: Run plotter (reads from FIFO)
-    cat /tmp/imu_data.fifo | python3 tools/imu_live_plot_logger_stdin.py
 """
 
 import sys
@@ -30,7 +23,7 @@ from pyocd.core.helpers import ConnectHelper
 
 
 def setup_logging():
-    """Minimal logging to stderr (stdout reserved for data)."""
+    """Minimal logging to stderr (stdout reserved for IMU CSV data)."""
     logging.basicConfig(
         level=logging.INFO,
         format="[%(levelname)s] %(message)s",
@@ -40,7 +33,7 @@ def setup_logging():
 
 
 def find_and_connect(log):
-    """Find and connect to STM32 via ST-Link."""
+    """Find and connect to the STM32 via ST-Link."""
     log.info("Scanning for ST-Link probes...")
     probes = ConnectHelper.get_all_connected_probes(blocking=False)
     if not probes:
@@ -52,7 +45,6 @@ def find_and_connect(log):
     probe_sn = getattr(probe, "serial_number", "unknown")
     log.info(f"Found probe: {probe_name} (Serial: {probe_sn})")
 
-    # Create a proper pyOCD session with the first connected probe.
     session = ConnectHelper.session_with_chosen_probe(
         blocking=False,
         return_first=True,
@@ -65,114 +57,154 @@ def find_and_connect(log):
 
     target_name = getattr(target, "part_number", getattr(target, "name", "unknown target"))
     log.info(f"Connected to {target_name}")
-    log.info("Halting target to access RTT buffer...")
+    log.info("Halting target briefly to locate RTT control block...")
 
     target.halt()
     time.sleep(0.5)
 
-    log.info("Resuming execution (RTT will operate in background)...")
+    log.info("Resuming target execution...")
     target.resume()
     time.sleep(0.5)
 
     return session, target
 
 
-def read_rtt_buffer(session, max_retries=5):
+def find_rtt_control_block(session, max_retries=5):
     """
-    Attempt to read SEGGER RTT control block.
+    Locate the SEGGER RTT control block in SRAM by scanning for its
+    magic ID string "SEGGER RTT".
 
-    RTT control block located at known address in RAM.
-    For L476: typically 0x20000000 (start of SRAM1).
+    The control block sits at a fixed offset inside SRAM1 on the STM32L476.
+    Its exact address depends on the linker, so we scan the first 96 KB.
     """
     log = logging.getLogger(__name__)
 
-    # Find RTT control block by SEGGER ID string at acID[16].
     rtt_id = b"SEGGER RTT"
     base_addr = 0x20000000
-    search_size = 0x18000  # Search first 96KB of SRAM1 (0x20000000-0x20017FFF)
+    search_size = 0x18000  # 96 KB covers all of SRAM1 on the L476
 
-    log.info("Searching for RTT control block...")
+    log.info("Searching for RTT control block in SRAM...")
 
     for attempt in range(max_retries):
         try:
-            # Read raw bytes and search for control block ID string.
             data = bytes(session.target.read_memory_block8(base_addr, search_size))
             idx = data.find(rtt_id)
             if idx >= 0:
                 rtt_addr = base_addr + idx
-                log.info(f"Found RTT control block at 0x{rtt_addr:08x}")
+                log.info(f"RTT control block found at 0x{rtt_addr:08x}")
                 return rtt_addr
-
             time.sleep(0.5)
-
         except Exception as e:
             log.warning(f"Attempt {attempt + 1}/{max_retries} failed: {e}")
             time.sleep(0.5)
 
-    log.error("Could not locate RTT control block")
+    log.error("RTT control block not found. Is SEGGER_RTT_Init() called?")
     return None
 
 
+def route_line(line):
+    """
+    Decide where each RTT line goes.
+
+    Lines starting with "T," are IMU CSV rows intended for the plotter.
+    They are written to stdout so the pipe to imu_live_plot_logger.py works.
+
+    Every other line (barometer "P," rows, boot messages, health summaries,
+    sensor errors) is written to stderr so it appears in the terminal.
+    """
+    stripped = line.rstrip("\r\n")
+    if stripped.startswith("T,"):
+        sys.stdout.write(line)
+        sys.stdout.flush()
+    else:
+        # Print non-IMU lines to terminal with a clear prefix so they are easy
+        # to spot and distinguish from pyocd log messages.
+        print(f"[RTT] {stripped}", file=sys.stderr)
+
+
 def stream_rtt_data(session, rtt_addr):
-    """Stream RTT data to stdout in CSV format."""
+    """
+    Read the RTT up-buffer in a polling loop and route each complete line.
+
+    The RTT up-buffer is a circular FIFO in SRAM. The write position (Pos)
+    is updated by the firmware after each SEGGER_RTT_Write / printf call.
+    We read from our last known position to the current Pos on every poll,
+    handle wrap-around, and then assemble complete newline-terminated lines
+    before routing them.
+
+    Control block layout (Cortex-M, 32-bit):
+        +0   acID[16]           - "SEGGER RTT" magic string
+        +16  MaxNumUpBuffers    - u32
+        +20  MaxNumDownBuffers  - u32
+        +24  aUp[0].pBuffer    - u32 pointer to ring buffer in SRAM
+        +28  aUp[0].BufferSize - u32 total buffer capacity in bytes
+        +32  aUp[0].WrOff      - u32 current write offset (firmware side)
+        +36  aUp[0].RdOff      - u32 current read offset  (host side)
+    """
     log = logging.getLogger(__name__)
-    log.info("Starting RTT stream. Sending data to stdout...")
+    log.info("Starting RTT stream. IMU data -> plotter, everything else -> terminal.")
     log.info("Press Ctrl+C to stop.\n")
 
     target = session.target
 
-    # Layout from this project's SEGGER_RTT.c on Cortex-M:
-    # SEGGER_RTT_CB:
-    #   +0  : acID[16]
-    #   +16 : MaxNumUpBuffers (u32)
-    #   +20 : MaxNumDownBuffers (u32)
-    #   +24 : aUp[0].pBuffer (u32 ptr)
-    #   +28 : aUp[0].BufferSize (u32)
-    #   +32 : aUp[0].Pos (u32)
-    up_pbuffer_off = 24
-    up_size_off = 28
-    up_pos_off = 32
-
     def read_u32(addr):
         return target.read_memory_block32(addr, 1)[0]
 
-    up_buf_addr = read_u32(rtt_addr + up_pbuffer_off)
-    up_buf_size = read_u32(rtt_addr + up_size_off)
-    last_pos = read_u32(rtt_addr + up_pos_off)
+    up_buf_addr = read_u32(rtt_addr + 24)
+    up_buf_size = read_u32(rtt_addr + 28)
+    last_pos    = read_u32(rtt_addr + 32)
 
     if up_buf_addr == 0 or up_buf_size == 0:
-        log.error("RTT up-buffer is not initialized yet")
+        log.error("RTT up-buffer is not initialised. Has the firmware started?")
         return
 
-    log.info(f"RTT up-buffer at 0x{up_buf_addr:08x}, size={up_buf_size}")
+    log.info(f"RTT up-buffer: address=0x{up_buf_addr:08x}  size={up_buf_size} bytes")
+
+    # Partial line buffer: collects bytes until a newline is received.
+    line_buf = ""
 
     try:
         while True:
             try:
-                time.sleep(0.02)
-                pos = read_u32(rtt_addr + up_pos_off)
+                time.sleep(0.02)  # 20 ms poll -> up to 50 polls/s, low CPU load
+                pos = read_u32(rtt_addr + 32)
 
                 if pos == last_pos:
                     continue
 
                 if pos > up_buf_size:
-                    log.warning(f"Invalid RTT position {pos}, resetting read pointer")
+                    log.warning(f"RTT write offset {pos} exceeds buffer size, resetting.")
                     last_pos = 0
                     continue
 
+                # Read new bytes from the circular buffer, handling wrap-around.
                 if pos > last_pos:
-                    chunk = bytes(target.read_memory_block8(up_buf_addr + last_pos, pos - last_pos))
+                    chunk = bytes(
+                        target.read_memory_block8(up_buf_addr + last_pos, pos - last_pos)
+                    )
                 else:
-                    # Wrap-around in circular buffer.
-                    chunk1 = bytes(target.read_memory_block8(up_buf_addr + last_pos, up_buf_size - last_pos))
-                    chunk2 = bytes(target.read_memory_block8(up_buf_addr, pos))
-                    chunk = chunk1 + chunk2
-
-                if chunk:
-                    sys.stdout.write(chunk.decode("utf-8", errors="ignore"))
-                    sys.stdout.flush()
+                    # Buffer has wrapped: read tail then head.
+                    tail = bytes(
+                        target.read_memory_block8(up_buf_addr + last_pos, up_buf_size - last_pos)
+                    )
+                    head = bytes(
+                        target.read_memory_block8(up_buf_addr, pos)
+                    )
+                    chunk = tail + head
 
                 last_pos = pos
+
+                if not chunk:
+                    continue
+
+                # Decode and split into lines. Keep any incomplete tail in line_buf.
+                text = chunk.decode("utf-8", errors="ignore")
+                line_buf += text
+
+                # Process every complete line (terminated by \n).
+                while "\n" in line_buf:
+                    line, line_buf = line_buf.split("\n", 1)
+                    route_line(line + "\n")
 
             except KeyboardInterrupt:
                 raise
@@ -181,7 +213,10 @@ def stream_rtt_data(session, rtt_addr):
                 time.sleep(0.5)
 
     except KeyboardInterrupt:
-        log.info("Stopping RTT stream")
+        # Flush any partial line sitting in the buffer.
+        if line_buf.strip():
+            route_line(line_buf)
+        log.info("RTT stream stopped.")
 
 
 def main():
@@ -190,17 +225,14 @@ def main():
     try:
         session, target = find_and_connect(log)
 
-        # Try to locate and stream RTT data
-        rtt_addr = read_rtt_buffer(session)
+        rtt_addr = find_rtt_control_block(session)
         if rtt_addr:
             stream_rtt_data(session, rtt_addr)
         else:
-            log.error(
-                "Failed to find RTT buffer. Make sure:"
-            )
-            log.error("  1. Code is compiled with SEGGER_RTT enabled")
-            log.error("  2. SEGGER_RTT_Init() called in main()")
-            log.error("  3. Device is running (not stuck in Error_Handler)")
+            log.error("Cannot start stream without a valid RTT control block.")
+            log.error("Check: SEGGER_RTT_Init() is called, firmware is running,")
+            log.error("and the device is not stuck in Error_Handler().")
+            sys.exit(1)
 
     except Exception as e:
         log.error(f"Fatal error: {e}")
