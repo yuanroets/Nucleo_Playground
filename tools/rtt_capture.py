@@ -22,6 +22,11 @@ import logging
 from pyocd.core.helpers import ConnectHelper
 
 
+# Firmware sends IMU CSV lines with this prefix.
+# Everything else is treated as diagnostic text for the terminal.
+IMU_PREFIX = "T,"
+
+
 def setup_logging():
     """Minimal logging to stderr (stdout reserved for IMU CSV data)."""
     logging.basicConfig(
@@ -113,7 +118,7 @@ def route_line(line):
     sensor errors) is written to stderr so it appears in the terminal.
     """
     stripped = line.rstrip("\r\n")
-    if stripped.startswith("T,"):
+    if stripped.startswith(IMU_PREFIX):
         sys.stdout.write(line)
         sys.stdout.flush()
     else:
@@ -223,10 +228,13 @@ def main():
     log = setup_logging()
 
     try:
+        # Step 1: connect over SWD through ST-Link.
         session, target = find_and_connect(log)
 
+        # Step 2: locate SEGGER RTT control block created by firmware.
         rtt_addr = find_rtt_control_block(session)
         if rtt_addr:
+            # Step 3: stream and route lines to plotter (stdout) or terminal (stderr).
             stream_rtt_data(session, rtt_addr)
         else:
             log.error("Cannot start stream without a valid RTT control block.")

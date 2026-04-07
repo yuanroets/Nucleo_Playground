@@ -21,6 +21,7 @@ from matplotlib.animation import FuncAnimation
 
 
 def parse_line(line):
+    # Fast, strict parser: only accept full 8-field IMU rows.
     parts = line.strip().split(",")
     if len(parts) != 8 or parts[0] != "T":
         return None
@@ -47,6 +48,7 @@ def main():
     # Number of samples to retain in the rolling window.
     window_size = int(window_seconds * sample_rate_hz)
 
+    # Redraw period for matplotlib animation callback.
     update_interval = 50  # milliseconds
     csv_file = None
 
@@ -60,7 +62,7 @@ def main():
         except IOError as e:
             print(f"Warning: Could not open CSV file: {e}", file=sys.stderr)
 
-    # Data buffers for live plotting
+    # Rolling deques keep memory bounded and naturally implement a sliding window.
     data = {
         "t": deque(maxlen=window_size),
         "ax": deque(maxlen=window_size),
@@ -75,7 +77,7 @@ def main():
     # From firmware: ±16g maps to ~±32768 LSB -> 32768 / 16 = 2048 LSB per g.
     acc_lsb_per_g = 2048.0
 
-    # Setup matplotlib
+    # Setup matplotlib figure with stacked accel/gyro plots sharing time base.
     fig, axes = plt.subplots(2, 1, figsize=(12, 8))
     fig.suptitle("IMU Live Plot (6-Axis: Accel + Gyro)")
 
@@ -116,7 +118,7 @@ def main():
         ay_g = ay / acc_lsb_per_g
         az_g = az / acc_lsb_per_g
 
-        # Append to buffers using real time (seconds) on the x-axis.
+        # Append to rolling buffers using real time (seconds) on the x-axis.
         data["t"].append(t_s)
         data["ax"].append(ax_g)
         data["ay"].append(ay_g)
@@ -155,7 +157,7 @@ def main():
 
         return line_ax, line_ay, line_az, line_gx, line_gy, line_gz
 
-    # Start reading from stdin in background
+    # Read stdin in a background thread so matplotlib GUI loop stays responsive.
     import threading
 
     def stdin_reader():
@@ -171,7 +173,8 @@ def main():
     reader_thread = threading.Thread(target=stdin_reader, daemon=True)
     reader_thread.start()
 
-    # Create animation
+    # FuncAnimation calls update_plot at a fixed interval on the GUI thread.
+    # blit=False keeps compatibility across backends and dynamic axes limits.
     ani = FuncAnimation(
         fig, update_plot, interval=update_interval, blit=False, cache_frame_data=False
     )

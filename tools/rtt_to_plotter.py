@@ -24,6 +24,7 @@ import argparse
 from pathlib import Path
 
 # OpenOCD configuration for ST-Link on Nucleo-L476RG
+# This loads the interface and target scripts, then initializes SWD transport.
 OPENOCD_CONFIG = """
 source [find interface/stlink.cfg]
 source [find target/stm32l4x.cfg]
@@ -65,7 +66,7 @@ def start_openocd_rtt(openocd_path):
         with open(config_file, "w") as f:
             f.write(OPENOCD_CONFIG)
 
-        # Start OpenOCD process
+        # Start OpenOCD and keep its output pipe open so we can inspect logs.
         proc = subprocess.Popen(
             [openocd_path, "-f", config_file, "-c", OPENOCD_COMMANDS],
             stdout=subprocess.PIPE,
@@ -95,8 +96,9 @@ def capture_rtt_output(proc, timeout=30):
     - JLinkExe tool, OR
     - OpenOCD with RTT plugin (requires newer openocd build)
 
-    For now, this script documents the setup. Production use would integrate
-    with pyocd or similar Python RTT client.
+    For now, this script is intentionally documentation/scaffolding.
+    It validates OpenOCD startup flow and explains why pyOCD is used for
+    robust RTT byte-stream extraction in this repository.
     """
     print(
         "[!] RTT capture via OpenOCD requires additional setup.",
@@ -123,7 +125,7 @@ def main():
     )
     args = parser.parse_args()
 
-    # Check for OpenOCD
+    # 1) Resolve OpenOCD from PATH.
     openocd = find_openocd()
     if not openocd:
         print(
@@ -134,16 +136,16 @@ def main():
 
     print(f"[+] Found OpenOCD at: {openocd}", file=sys.stderr)
 
-    # Start OpenOCD with RTT
+    # 2) Start OpenOCD with a temporary config and RTT commands.
     proc = start_openocd_rtt(openocd)
     if not proc:
         sys.exit(1)
 
     try:
-        # RTT capture would happen here
+        # 3) Document current capture limitation and suggest supported options.
         capture_rtt_output(proc)
 
-        # Keep process alive
+        # 4) Keep the OpenOCD process alive until user interrupts.
         proc.wait()
 
     except KeyboardInterrupt:
