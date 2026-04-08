@@ -22,6 +22,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
+#include <string.h>
 #include "bmi270.h"
 #include "bmp3.h"
 #include "SEGGER_RTT.h"
@@ -41,6 +42,10 @@
 #define IMU_VISUAL_REFRESH_MS 5U
 /* Barometer task period: 25 Hz output is enough for altitude/temperature trend. */
 #define BARO_VISUAL_REFRESH_MS 40U
+/* UART RX DMA buffer used for GPS NMEA capture. */
+#define GPS_RX_DMA_BUFFER_SIZE 256U
+/* Line buffer for one NMEA sentence. */
+#define GPS_NMEA_LINE_BUFFER_SIZE 128U
 
 /* USER CODE END PD */
 
@@ -53,7 +58,9 @@
 I2C_HandleTypeDef hi2c1;
 I2C_HandleTypeDef hi2c2;
 
+UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
+DMA_HandleTypeDef hdma_usart1_rx;
 
 /* USER CODE BEGIN PV */
 /* Event flag set by EXTI callback when a valid (debounced) button press occurs. */
@@ -100,6 +107,33 @@ struct bmp3_dev bmp_dev;
 /* Latest pressure/temperature sample from BMP390. */
 struct bmp3_data bmp_data = { 0 };
 
+/* High-resolution PPS sync point captured from the GPS PPS interrupt.
+ * DWT cycle counter is much finer than HAL_GetTick() and is suitable for drift correction.
+ */
+volatile uint32_t gps_pps_cycle_stamp = 0U;
+volatile uint32_t gps_pps_tick_stamp = 0U;
+volatile uint8_t gps_pps_sync_ready = 0U;
+
+/* Circular DMA receive buffer filled by USART1. */
+static uint8_t gps_rx_dma_buffer[GPS_RX_DMA_BUFFER_SIZE];
+/* Read index into the circular DMA buffer. */
+static uint16_t gps_rx_old_pos = 0U;
+/* Line assembly buffer for one NMEA sentence. */
+static char gps_line_buffer[GPS_NMEA_LINE_BUFFER_SIZE];
+/* Current length of the line assembly buffer. */
+static uint16_t gps_line_length = 0U;
+
+typedef struct
+{
+  char utc[16];
+  uint8_t fix_quality;
+  uint8_t satellites;
+  uint8_t valid;
+} gps_status_t;
+
+static gps_status_t gps_status = { { 0 }, 0U, 0U, 0U };
+static volatile uint8_t gps_status_dirty = 0U;
+
 typedef struct
 {
   I2C_HandleTypeDef *hi2c;
@@ -113,11 +147,23 @@ bmp3_i2c_ctx_t bmp3_i2c_ctx;
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_I2C2_Init(void);
+static void MX_USART1_UART_Init(void);
 /* USER CODE BEGIN PFP */
 int __io_putchar(int ch);
+static void gps_uart_start_reception(void);
+static void gps_uart_process_dma_chunk(uint16_t new_pos);
+static void gps_uart_process_byte(uint8_t byte);
+static void gps_emit_status(void);
+static uint8_t gps_parse_gga_sentence(const char *line);
+static uint8_t gps_validate_checksum(const char *line);
+static const char *gps_skip_field(const char *field);
+static uint8_t gps_parse_uint8_field(const char *start, const char *end, uint8_t *value);
+static uint8_t gps_format_utc_field(const char *start, size_t length, char *out, size_t out_len);
+static int8_t gps_hex_to_nibble(char c);
 static BMI2_INTF_RETURN_TYPE bmi2_i2c_read(uint8_t reg_addr, uint8_t *reg_data, uint32_t len, void *intf_ptr);
 static BMI2_INTF_RETURN_TYPE bmi2_i2c_write(uint8_t reg_addr,
                                             const uint8_t *reg_data,
@@ -169,6 +215,404 @@ int __io_putchar(int ch)
   SEGGER_RTT_PutChar(c);
   /* Return original character as stdio expects. */
   return ch;
+}
+
+/* Start USART1 receive-to-idle on the circular GPS RX buffer. */
+static void gps_uart_start_reception(void)
+{
+  if (HAL_UARTEx_ReceiveToIdle_DMA(&huart1, gps_rx_dma_buffer, GPS_RX_DMA_BUFFER_SIZE) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /* Half-transfer interrupts are not needed for NMEA line handling. */
+  if (huart1.hdmarx != NULL)
+  {
+    __HAL_DMA_DISABLE_IT(huart1.hdmarx, DMA_IT_HT);
+  }
+
+  gps_rx_old_pos = 0U;
+  gps_line_length = 0U;
+}
+
+/* Handle one new slice from the circular DMA buffer. */
+static void gps_uart_process_dma_chunk(uint16_t new_pos)
+{
+  uint16_t pos;
+
+  if (new_pos > GPS_RX_DMA_BUFFER_SIZE)
+  {
+    new_pos = GPS_RX_DMA_BUFFER_SIZE;
+  }
+
+  pos = gps_rx_old_pos;
+
+  if (new_pos == pos)
+  {
+    return;
+  }
+
+  if (new_pos > pos)
+  {
+    while (pos < new_pos)
+    {
+      gps_uart_process_byte(gps_rx_dma_buffer[pos]);
+      pos++;
+    }
+  }
+  else
+  {
+    while (pos < GPS_RX_DMA_BUFFER_SIZE)
+    {
+      gps_uart_process_byte(gps_rx_dma_buffer[pos]);
+      pos++;
+    }
+
+    pos = 0U;
+    while (pos < new_pos)
+    {
+      gps_uart_process_byte(gps_rx_dma_buffer[pos]);
+      pos++;
+    }
+  }
+
+  gps_rx_old_pos = new_pos;
+}
+
+/* Assemble NMEA lines from raw bytes and parse complete GGA sentences. */
+static void gps_uart_process_byte(uint8_t byte)
+{
+  char c = (char) byte;
+
+  if (c == '\r')
+  {
+    return;
+  }
+
+  if (c == '\n')
+  {
+    if (gps_line_length > 0U)
+    {
+      gps_line_buffer[gps_line_length] = '\0';
+      (void) gps_parse_gga_sentence(gps_line_buffer);
+    }
+
+    gps_line_length = 0U;
+    return;
+  }
+
+  if (gps_line_length < (GPS_NMEA_LINE_BUFFER_SIZE - 1U))
+  {
+    gps_line_buffer[gps_line_length] = c;
+    gps_line_length++;
+  }
+  else
+  {
+    /* Drop the partial sentence if it overflows the line buffer. */
+    gps_line_length = 0U;
+  }
+}
+
+/* Parse and publish one GGA sentence.
+ * The parser is intentionally small: it only extracts UTC time, fix quality,
+ * and satellite count because that is enough to validate GPS lock and antenna health.
+ */
+static uint8_t gps_parse_gga_sentence(const char *line)
+{
+  const char *field_start;
+  const char *field_end;
+  uint8_t fix_quality;
+  uint8_t satellites;
+
+  if ((line == NULL) || (line[0] != '$') || (strncmp(&line[3], "GGA,", 4U) != 0))
+  {
+    return 0U;
+  }
+
+  if (!gps_validate_checksum(line))
+  {
+    return 0U;
+  }
+
+  /* Field 1: UTC time (hhmmss.sss). */
+  field_start = &line[7];
+  field_end = strchr(field_start, ',');
+  if (field_end == NULL)
+  {
+    return 0U;
+  }
+
+  if (!gps_format_utc_field(field_start,
+                            (size_t) (field_end - field_start),
+                            gps_status.utc,
+                            sizeof(gps_status.utc)))
+  {
+    return 0U;
+  }
+
+  /* Skip latitude, N/S, longitude, and E/W fields. */
+  field_start = gps_skip_field(field_end + 1);
+  if (field_start == NULL)
+  {
+    return 0U;
+  }
+
+  field_start = gps_skip_field(field_start);
+  if (field_start == NULL)
+  {
+    return 0U;
+  }
+
+  field_start = gps_skip_field(field_start);
+  if (field_start == NULL)
+  {
+    return 0U;
+  }
+
+  field_start = gps_skip_field(field_start);
+  if (field_start == NULL)
+  {
+    return 0U;
+  }
+
+  /* Field 6: fix quality. */
+  field_end = strchr(field_start, ',');
+  if (field_end == NULL)
+  {
+    field_end = strchr(field_start, '*');
+  }
+  if ((field_end == NULL) || !gps_parse_uint8_field(field_start, field_end, &fix_quality))
+  {
+    return 0U;
+  }
+
+  /* Field 7: number of satellites. */
+  field_start = gps_skip_field(field_start);
+  if (field_start == NULL)
+  {
+    return 0U;
+  }
+
+  field_end = strchr(field_start, ',');
+  if (field_end == NULL)
+  {
+    field_end = strchr(field_start, '*');
+  }
+  if ((field_end == NULL) || !gps_parse_uint8_field(field_start, field_end, &satellites))
+  {
+    return 0U;
+  }
+
+  gps_status.fix_quality = fix_quality;
+  gps_status.satellites = satellites;
+  gps_status.valid = 1U;
+  gps_status_dirty = 1U;
+  return 1U;
+}
+
+/* Skip to the character immediately after the next comma-delimited field. */
+static const char *gps_skip_field(const char *field)
+{
+  const char *comma;
+
+  if (field == NULL)
+  {
+    return NULL;
+  }
+
+  comma = strchr(field, ',');
+  if (comma == NULL)
+  {
+    return NULL;
+  }
+
+  return comma + 1;
+}
+
+/* Parse an unsigned 8-bit integer from a bounded NMEA field. */
+static uint8_t gps_parse_uint8_field(const char *start, const char *end, uint8_t *value)
+{
+  uint32_t result = 0U;
+  const char *p;
+
+  if ((start == NULL) || (end == NULL) || (value == NULL) || (start >= end))
+  {
+    return 0U;
+  }
+
+  for (p = start; p < end; p++)
+  {
+    if ((*p < '0') || (*p > '9'))
+    {
+      return 0U;
+    }
+
+    result = (result * 10U) + (uint32_t) (*p - '0');
+    if (result > 255U)
+    {
+      return 0U;
+    }
+  }
+
+  *value = (uint8_t) result;
+  return 1U;
+}
+
+/* Format NMEA UTC hhmmss.sss into a readable HH:MM:SS[.ss] string. */
+static uint8_t gps_format_utc_field(const char *start, size_t length, char *out, size_t out_len)
+{
+  size_t i;
+  size_t written;
+  size_t frac_len;
+  size_t dot_index;
+  uint8_t hour;
+  uint8_t minute;
+  uint8_t second;
+
+  if ((start == NULL) || (out == NULL) || (out_len < 9U) || (length < 6U))
+  {
+    return 0U;
+  }
+
+  for (i = 0U; i < 6U; i++)
+  {
+    if ((start[i] < '0') || (start[i] > '9'))
+    {
+      return 0U;
+    }
+  }
+
+  hour = (uint8_t) ((start[0] - '0') * 10U + (start[1] - '0'));
+  minute = (uint8_t) ((start[2] - '0') * 10U + (start[3] - '0'));
+  second = (uint8_t) ((start[4] - '0') * 10U + (start[5] - '0'));
+
+  written = (size_t) snprintf(out, out_len, "%02u:%02u:%02u",
+                              (unsigned int) hour,
+                              (unsigned int) minute,
+                              (unsigned int) second);
+  if ((written == 0U) || (written >= out_len))
+  {
+    return 0U;
+  }
+
+  dot_index = length;
+  for (i = 0U; i < length; i++)
+  {
+    if (start[i] == '.')
+    {
+      dot_index = i;
+      break;
+    }
+  }
+
+  if (dot_index < length)
+  {
+    frac_len = length - dot_index - 1U;
+    if (frac_len > 2U)
+    {
+      frac_len = 2U;
+    }
+
+    if ((frac_len > 0U) && ((written + 1U + frac_len) < out_len))
+    {
+      out[written] = '.';
+      written++;
+      for (i = 0U; i < frac_len; i++)
+      {
+        out[written] = start[dot_index + 1U + i];
+        written++;
+      }
+
+      out[written] = '\0';
+    }
+  }
+
+  return 1U;
+}
+
+/* Validate the NMEA checksum if the sentence carries one. */
+static uint8_t gps_validate_checksum(const char *line)
+{
+  const char *asterisk;
+  const char *p;
+  uint8_t checksum;
+  int8_t hi;
+  int8_t lo;
+
+  if (line == NULL)
+  {
+    return 0U;
+  }
+
+  asterisk = strchr(line, '*');
+  if (asterisk == NULL)
+  {
+    return 1U;
+  }
+
+  checksum = 0U;
+  for (p = &line[1]; (p < asterisk) && (*p != '\0'); p++)
+  {
+    checksum ^= (uint8_t) *p;
+  }
+
+  if ((asterisk[1] == '\0') || (asterisk[2] == '\0'))
+  {
+    return 0U;
+  }
+
+  hi = gps_hex_to_nibble(asterisk[1]);
+  lo = gps_hex_to_nibble(asterisk[2]);
+  if ((hi < 0) || (lo < 0))
+  {
+    return 0U;
+  }
+
+  return ((uint8_t) ((hi << 4) | lo) == checksum) ? 1U : 0U;
+}
+
+/* Convert a hex character into a 0-15 nibble. */
+static int8_t gps_hex_to_nibble(char c)
+{
+  if ((c >= '0') && (c <= '9'))
+  {
+    return (int8_t) (c - '0');
+  }
+
+  if ((c >= 'a') && (c <= 'f'))
+  {
+    return (int8_t) (10 + (c - 'a'));
+  }
+
+  if ((c >= 'A') && (c <= 'F'))
+  {
+    return (int8_t) (10 + (c - 'A'));
+  }
+
+  return (int8_t) -1;
+}
+
+/* Emit the latest parsed GPS status as a compact RTT line.
+ * This stays separate from the IMU CSV stream by using a distinct prefix.
+ */
+static void gps_emit_status(void)
+{
+  gps_status_t snapshot;
+
+  if (gps_status_dirty == 0U)
+  {
+    return;
+  }
+
+  __disable_irq();
+  snapshot = gps_status;
+  gps_status_dirty = 0U;
+  __enable_irq();
+
+  SEGGER_RTT_printf("GPS|UTC=%s Fix=%u Sats=%u\r\n",
+                    snapshot.utc,
+                    (unsigned int) snapshot.fix_quality,
+                    (unsigned int) snapshot.satellites);
 }
 
 /* Bosch read callback: read bytes from BMI270 register space via I2C. */
@@ -571,15 +1015,31 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_USART2_UART_Init();
   MX_I2C1_Init();
   MX_I2C2_Init();
+  MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
   /* STEP A: Initialize SEGGER RTT for debug output over SWD/ST-Link.
    * This must happen before any printf() calls.
    * RTT uses the debug connection (no UART needed for debug output).
    */
   SEGGER_RTT_Init();
+
+  /* Release GPS reset explicitly.
+   * GPS_RESET is active-low on this hardware, so the module will stay off if this pin remains low.
+   */
+  HAL_GPIO_WritePin(GPS_RST_GPIO_Port, GPS_RST_Pin, GPIO_PIN_SET);
+  HAL_Delay(50);
+
+  /* Enable the high-resolution DWT cycle counter for PPS capture. */
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CYCCNT = 0U;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+
+  /* Start GPS receive-to-idle on USART1 DMA before entering the main loop. */
+  gps_uart_start_reception();
 
   /* STEP D: first visible debug print. If you see this in RTT, CPU + debug link are alive. */
   printf("Booting...\r\n");
@@ -741,6 +1201,9 @@ int main(void)
              (unsigned long) baro_read_ok_count,
              (unsigned long) baro_read_err_count);
     }
+
+    /* TASK 6: publish the latest GPS status line when a new GGA sentence has been parsed. */
+    gps_emit_status();
   }
   /* USER CODE END 3 */
 }
@@ -891,6 +1354,41 @@ static void MX_I2C2_Init(void)
 }
 
 /**
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART1_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART1_Init 0 */
+
+  /* USER CODE END USART1_Init 0 */
+
+  /* USER CODE BEGIN USART1_Init 1 */
+
+  /* USER CODE END USART1_Init 1 */
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 38400;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart1.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart1.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART1_Init 2 */
+
+  /* USER CODE END USART1_Init 2 */
+
+}
+
+/**
   * @brief USART2 Initialization Function
   * @param None
   * @retval None
@@ -926,6 +1424,22 @@ static void MX_USART2_UART_Init(void)
 }
 
 /**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Channel5_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel5_IRQn, 2, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel5_IRQn);
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -944,6 +1458,9 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOC, GPS_EINT_Pin|GPS_RST_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin : Button_Pin */
@@ -951,6 +1468,19 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(Button_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : GPS_PPS_Pin */
+  GPIO_InitStruct.Pin = GPS_PPS_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPS_PPS_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : GPS_EINT_Pin GPS_RST_Pin */
+  GPIO_InitStruct.Pin = GPS_EINT_Pin|GPS_RST_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
   /*Configure GPIO pin : LD2_Pin */
   GPIO_InitStruct.Pin = LD2_Pin;
@@ -960,7 +1490,10 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_Init(LD2_GPIO_Port, &GPIO_InitStruct);
 
   /* EXTI interrupt init*/
-  HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(EXTI0_IRQn, 1, 0);
+  HAL_NVIC_EnableIRQ(EXTI0_IRQn);
+
+  HAL_NVIC_SetPriority(EXTI15_10_IRQn, 3, 0);
   HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
@@ -974,6 +1507,22 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+/* Receive-to-idle callback runs from the UART interrupt path.
+ * We only move bytes into a line buffer and parse the sentence; the RTT print happens in the main loop.
+ */
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
+{
+  if (huart == NULL)
+  {
+    return;
+  }
+
+  if (huart->Instance == USART1)
+  {
+    gps_uart_process_dma_chunk(Size);
+  }
+}
+
 /* EXTI callback runs when configured GPIO interrupt fires.
  * Keep ISR work minimal: just debounce + set event flag.
  */
@@ -993,6 +1542,13 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
       /* Signal main loop to handle the real behavior change. */
       button_event = 1;
     }
+  }
+  else if (GPIO_Pin == GPS_PPS_Pin)
+  {
+    /* Capture a high-resolution synchronization point for GPS/IMU drift correction. */
+    gps_pps_cycle_stamp = DWT->CYCCNT;
+    gps_pps_tick_stamp = HAL_GetTick();
+    gps_pps_sync_ready = 1U;
   }
 }
 
