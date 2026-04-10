@@ -49,6 +49,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     third_party/BMI270_SensorAPI/bmi270.c
     third_party/BMP3_SensorAPI/bmp3.c
     third_party/SEGGER_RTT/SEGGER_RTT.c
+    third_party/ubxlib/common/ubx_protocol/src/u_ubx_protocol.c
 )
 
 # Add include paths
@@ -57,6 +58,8 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     third_party/BMI270_SensorAPI
     third_party/BMP3_SensorAPI
     third_party/SEGGER_RTT
+    third_party/ubxlib/common/ubx_protocol/api
+    third_party/ubxlib/common/error/api
 )
 
 # Add project symbols (macros)
