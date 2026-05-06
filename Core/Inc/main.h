@@ -60,13 +60,13 @@ void Error_Handler(void);
 #define Button_Pin GPIO_PIN_13
 #define Button_GPIO_Port GPIOC
 #define Button_EXTI_IRQn EXTI15_10_IRQn
-#define GPS_PPS_Pin GPIO_PIN_0
-#define GPS_PPS_GPIO_Port GPIOC
-#define GPS_PPS_EXTI_IRQn EXTI0_IRQn
-#define GPS_EINT_Pin GPIO_PIN_1
-#define GPS_EINT_GPIO_Port GPIOC
-#define GPS_RST_Pin GPIO_PIN_2
-#define GPS_RST_GPIO_Port GPIOC
+#define GPS_PPS_o_Pin GPIO_PIN_0
+#define GPS_PPS_o_GPIO_Port GPIOC
+#define GPS_PPS_o_EXTI_IRQn EXTI0_IRQn
+#define GPS_EINT_o_Pin GPIO_PIN_1
+#define GPS_EINT_o_GPIO_Port GPIOC
+#define SD_BTN_Pin GPIO_PIN_2
+#define SD_BTN_GPIO_Port GPIOC
 #define USART_TX_Pin GPIO_PIN_2
 #define USART_TX_GPIO_Port GPIOA
 #define USART_RX_Pin GPIO_PIN_3
@@ -75,6 +75,13 @@ void Error_Handler(void);
 #define LD2_GPIO_Port GPIOA
 #define SD_CS_Pin GPIO_PIN_4
 #define SD_CS_GPIO_Port GPIOC
+#define GPS_RST_Pin GPIO_PIN_8
+#define GPS_RST_GPIO_Port GPIOC
+#define GPS_EINT_Pin GPIO_PIN_9
+#define GPS_EINT_GPIO_Port GPIOC
+#define GPS_PPS_Pin GPIO_PIN_8
+#define GPS_PPS_GPIO_Port GPIOA
+#define GPS_PPS_EXTI_IRQn EXTI9_5_IRQn
 #define USART1_TX_Pin GPIO_PIN_9
 #define USART1_TX_GPIO_Port GPIOA
 #define USART1_RX_Pin GPIO_PIN_10
@@ -85,11 +92,14 @@ void Error_Handler(void);
 #define TCK_GPIO_Port GPIOA
 #define SWO_Pin GPIO_PIN_3
 #define SWO_GPIO_Port GPIOB
+#define BMI_INT1_Pin GPIO_PIN_5
+#define BMI_INT1_GPIO_Port GPIOB
+#define BMI_INT1_EXTI_IRQn EXTI9_5_IRQn
 
 /* USER CODE BEGIN Private defines */
 #define B1_Pin Button_Pin
 #define B1_GPIO_Port Button_GPIO_Port
-
+#define SD_SPI_HANDLE hspi2
 /* USER CODE END Private defines */
 
 #ifdef __cplusplus

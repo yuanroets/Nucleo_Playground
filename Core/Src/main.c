@@ -26,12 +26,13 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <math.h>
 #include "bmi270.h"
 #include "bmp3.h"
 #include "SEGGER_RTT.h"
 #include "u_ubx_protocol.h"
 #include "u_error_common.h"
-
+#include <stdarg.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -49,6 +50,8 @@
 #define BARO_VISUAL_REFRESH_MS 40U
 /* GPS logging cadence (1 Hz) for dedicated GPS data file. */
 #define GPS_LOG_REFRESH_MS 1000U
+/* Set to 0 to keep the GPS code compiled in but fully inactive. */
+#define GPS_ENABLE 0U
 /* Flush all open CSV files from one central task in the main loop. */
 #define DATA_LOG_SYNC_MS 2000U
 /* Never block forever on I2C transfers; fail fast and recover next cycle. */
@@ -69,6 +72,10 @@
 #define BMI270_ACC_LSB_PER_G 2048.0
 /* BMI270 gyro raw output at +/-2000 dps is 16.384 LSB per dps. */
 #define BMI270_GYR_LSB_PER_DPS_2000 16.384
+/* LED blink period while SD logging is active. */
+#define LOG_LED_BLINK_MS 500U
+/* Standard atmosphere sea-level pressure used for barometric altitude estimate. */
+#define SEA_LEVEL_PRESSURE_PA 101325.0
 
 /* USER CODE END PD */
 
@@ -90,8 +97,9 @@ DMA_HandleTypeDef hdma_usart1_rx;
 /* USER CODE BEGIN PV */
 /* Event flag set by EXTI callback when a valid (debounced) button press occurs. */
 volatile uint8_t button_event = 0;
-/* 0 = LED off, 1 = LED on, 2 = LED blink. */
+/* Runtime SD logging state: 0 = stopped, 1 = active. */
 volatile uint8_t logging_active = 0;
+void myprintf(const char *fmt, ...);
 
 typedef struct
 {
@@ -153,10 +161,10 @@ static uint8_t system_time_initialized = 0U;
 static uint8_t system_time_locked = 0U;
 static uint8_t system_time_lock_reported = 0U;
 
-/* SD logging file handles split by sensor group. */
+/* SD logging file handles and state. */
 static FIL imu_log_file;
 static FIL baro_log_file;
-static FIL gps_log_file;
+static FIL gnss_log_file;
 static uint8_t data_log_ready = 0U;
 static uint32_t data_log_last_sync_tick = 0U;
 
@@ -242,15 +250,15 @@ static void format_fixed_decimal(char *buffer,
                                  uint8_t frac_digits);
 static FRESULT data_log_start(void);
 static void data_log_stop(void);
-static void gps_copy_status_snapshot(gps_status_t *snapshot);
 static void csv_log_imu_sample(const struct bmi2_sens_data *imu_sample,
-                               const gps_status_t *gps_sample,
+                               const gps_status_t *gps_snapshot,
                                uint32_t log_tick);
 static void csv_log_baro_sample(const struct bmp3_data *baro_sample,
-                                const gps_status_t *gps_sample,
+                                const gps_status_t *gps_snapshot,
                                 uint32_t log_tick);
-static void csv_log_gps_sample(const gps_status_t *gps_sample,
-                               uint32_t log_tick);
+static void csv_log_gnss_sample(const gps_status_t *gps_snapshot,
+                                uint32_t log_tick);
+static void gps_copy_status_snapshot(gps_status_t *snapshot);
 static uint8_t gps_parse_gga_sentence(const char *line);
 static uint8_t gps_validate_checksum(const char *line);
 static const char *gps_skip_field(const char *field);
@@ -273,6 +281,8 @@ static BMP3_INTF_RET_TYPE bmp3_i2c_write(uint8_t reg_addr,
 static void bmp3_delay_us(uint32_t period, void *intf_ptr);
 static uint8_t bmp390_detect_address(uint8_t *found_addr);
 static int8_t bmp390_basic_init(void);
+static uint8_t bmi270_detect_address(uint8_t *found_addr);
+static int8_t bmi270_basic_init(void);
 
 /* USER CODE END PFP */
 
@@ -294,6 +304,18 @@ static int8_t bmp390_basic_init(void);
  * 2) Configure BMI270 through Bosch driver callbacks.
  * 3) In the main loop, run simple non-blocking tasks (LED + IMU print).
  */
+
+void myprintf(const char *fmt, ...) {
+  static char buffer[256];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buffer, sizeof(buffer), fmt, args);
+  va_end(args);
+
+  int len = strlen(buffer);
+  HAL_UART_Transmit(&huart2, (uint8_t *) buffer, (uint16_t) len, HAL_MAX_DELAY);
+
+}
 
 /* Redirect printf characters to SEGGER RTT so logs appear over debug link.
  * RTT sends data through SWD/ST-Link with zero performance overhead.
@@ -418,124 +440,6 @@ static void system_time_handle_pps(uint32_t pps_tick)
   }
 }
 
-static FRESULT data_log_start(void)
-{
-  FRESULT result;
-
-  result = f_mount(&USERFatFS, USERPath, 1);
-  if (result == FR_NO_FILESYSTEM)
-  {
-    SEGGER_RTT_printf("SDLOG|mount failed: %d (no FAT filesystem)\r\n", (int) result);
-    SEGGER_RTT_printf("SDLOG|format card as FAT32 on PC, then press button again\r\n");
-    return result;
-  }
-
-  if (result == FR_DISK_ERR)
-  {
-    const unsigned int sd_stage = (unsigned int) USER_SD_GetDiagStage();
-    const unsigned int sd_cmd = (unsigned int) USER_SD_GetDiagLastCmd();
-    const unsigned int sd_r1 = (unsigned int) USER_SD_GetDiagLastR1();
-    const unsigned int sd_token = (unsigned int) USER_SD_GetDiagLastToken();
-    const unsigned int sd_card_type = (unsigned int) USER_SD_GetCardType();
-
-    SEGGER_RTT_printf("SDLOG|mount failed: %d (disk I/O error)\r\n", (int) result);
-    SEGGER_RTT_printf("SDLOG|check SD SPI wiring/power and card seat\r\n");
-    SEGGER_RTT_printf("SDLOG|diag stage=0x%02X cmd=%u r1=0x%02X token=0x%02X ctype=0x%02X\r\n",
-                      sd_stage,
-                      sd_cmd,
-                      sd_r1,
-                      sd_token,
-                      sd_card_type);
-    return result;
-  }
-
-  if (result != FR_OK)
-  {
-    SEGGER_RTT_printf("SDLOG|mount failed: %d\r\n", (int) result);
-    return result;
-  }
-
-  result = f_open(&imu_log_file, "0:/IMU_DATA.CSV", FA_CREATE_ALWAYS | FA_WRITE);
-  if (result != FR_OK)
-  {
-    SEGGER_RTT_printf("SDLOG|open IMU_DATA.CSV failed: %d\r\n", (int) result);
-    return result;
-  }
-
-  result = f_open(&baro_log_file, "0:/BARO_DATA.CSV", FA_CREATE_ALWAYS | FA_WRITE);
-  if (result != FR_OK)
-  {
-    (void) f_close(&imu_log_file);
-    SEGGER_RTT_printf("SDLOG|open BARO_DATA.CSV failed: %d\r\n", (int) result);
-    return result;
-  }
-
-  result = f_open(&gps_log_file, "0:/GPS_DATA.CSV", FA_CREATE_ALWAYS | FA_WRITE);
-  if (result != FR_OK)
-  {
-    (void) f_close(&baro_log_file);
-    (void) f_close(&imu_log_file);
-    SEGGER_RTT_printf("SDLOG|open GPS_DATA.CSV failed: %d\r\n", (int) result);
-    return result;
-  }
-
-  if (f_printf(&imu_log_file,
-               "Sys_Time,UTC_GPS,AccX_g,AccY_g,AccZ_g,GyroX_dps,GyroY_dps,GyroZ_dps\r\n") < 0)
-  {
-    (void) f_close(&gps_log_file);
-    (void) f_close(&baro_log_file);
-    (void) f_close(&imu_log_file);
-    SEGGER_RTT_printf("SDLOG|IMU header write failed\r\n");
-    return FR_DISK_ERR;
-  }
-
-  if (f_printf(&baro_log_file,
-               "Sys_Time,UTC_GPS,Temp_C,Press_kPa\r\n") < 0)
-  {
-    (void) f_close(&gps_log_file);
-    (void) f_close(&baro_log_file);
-    (void) f_close(&imu_log_file);
-    SEGGER_RTT_printf("SDLOG|BARO header write failed\r\n");
-    return FR_DISK_ERR;
-  }
-
-  if (f_printf(&gps_log_file,
-               "Sys_Time,UTC_GPS,Lat_deg,Lon_deg,Alt_m,Sats\r\n") < 0)
-  {
-    (void) f_close(&gps_log_file);
-    (void) f_close(&baro_log_file);
-    (void) f_close(&imu_log_file);
-    SEGGER_RTT_printf("SDLOG|GPS header write failed\r\n");
-    return FR_DISK_ERR;
-  }
-
-  data_log_ready = 1U;
-  data_log_last_sync_tick = HAL_GetTick();
-  (void) f_sync(&imu_log_file);
-  (void) f_sync(&baro_log_file);
-  (void) f_sync(&gps_log_file);
-  SEGGER_RTT_printf("SDLOG|logging started\r\n");
-  return FR_OK;
-}
-
-static void data_log_stop(void)
-{
-  if (data_log_ready == 0U)
-  {
-    return;
-  }
-
-  (void) f_sync(&imu_log_file);
-  (void) f_sync(&baro_log_file);
-  (void) f_sync(&gps_log_file);
-  (void) f_close(&imu_log_file);
-  (void) f_close(&baro_log_file);
-  (void) f_close(&gps_log_file);
-  data_log_ready = 0U;
-  HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
-  SEGGER_RTT_printf("SDLOG|logging stopped\r\n");
-}
-
 static void gps_copy_status_snapshot(gps_status_t *snapshot)
 {
   if (snapshot == NULL)
@@ -602,41 +506,145 @@ static void format_fixed_decimal(char *buffer,
   }
 }
 
+static FRESULT data_log_start(void)
+{
+  FRESULT result;
+  DWORD free_clusters;
+  DWORD free_sectors;
+  DWORD total_sectors;
+  FATFS *get_free_fs;
+
+  myprintf("\r\n~ SD card demo by kiwih ~\r\n\r\n");
+  result = f_mount(&USERFatFS, USERPath, 1);
+  if (result != FR_OK)
+  {
+    myprintf("f_mount error (%i)\r\n", (int) result);
+    return result;
+  }
+
+  result = f_getfree(USERPath, &free_clusters, &get_free_fs);
+  if (result != FR_OK)
+  {
+    myprintf("f_getfree error (%i)\r\n", (int) result);
+    (void) f_mount(NULL, USERPath, 0);
+    return result;
+  }
+
+  total_sectors = (get_free_fs->n_fatent - 2U) * get_free_fs->csize;
+  free_sectors = free_clusters * get_free_fs->csize;
+  myprintf("SD card stats:\r\n%10lu KiB total drive space.\r\n%10lu KiB available.\r\n",
+           (unsigned long) (total_sectors / 2U),
+           (unsigned long) (free_sectors / 2U));
+
+  result = f_open(&imu_log_file, "0:/IMU.csv", FA_OPEN_ALWAYS | FA_WRITE);
+  if (result != FR_OK)
+  {
+    myprintf("f_open IMU.csv error (%i)\r\n", (int) result);
+    return result;
+  }
+  if (f_size(&imu_log_file) == 0U)
+  {
+    if (f_printf(&imu_log_file,
+                 "tick_ms,utc,acc_x_raw,acc_y_raw,acc_z_raw,gyro_x_raw,gyro_y_raw,gyro_z_raw,acc_x_g,acc_y_g,acc_z_g,gyro_x_dps,gyro_y_dps,gyro_z_dps\r\n") < 0)
+    {
+      (void) f_close(&imu_log_file);
+      return FR_DISK_ERR;
+    }
+  }
+  (void) f_lseek(&imu_log_file, f_size(&imu_log_file));
+
+  result = f_open(&baro_log_file, "0:/BARO.csv", FA_OPEN_ALWAYS | FA_WRITE);
+  if (result != FR_OK)
+  {
+    (void) f_close(&imu_log_file);
+    myprintf("f_open BARO.csv error (%i)\r\n", (int) result);
+    return result;
+  }
+  if (f_size(&baro_log_file) == 0U)
+  {
+    if (f_printf(&baro_log_file,
+                 "tick_ms,utc,temp_c,pressure_kpa,altitude_m\r\n") < 0)
+    {
+      (void) f_close(&baro_log_file);
+      (void) f_close(&imu_log_file);
+      return FR_DISK_ERR;
+    }
+  }
+  (void) f_lseek(&baro_log_file, f_size(&baro_log_file));
+
+  result = f_open(&gnss_log_file, "0:/GNSS.csv", FA_OPEN_ALWAYS | FA_WRITE);
+  if (result != FR_OK)
+  {
+    (void) f_close(&baro_log_file);
+    (void) f_close(&imu_log_file);
+    myprintf("f_open GNSS.csv error (%i)\r\n", (int) result);
+    return result;
+  }
+  if (f_size(&gnss_log_file) == 0U)
+  {
+    if (f_printf(&gnss_log_file,
+                 "tick_ms,utc,lat_deg,lon_deg,alt_m,sats\r\n") < 0)
+    {
+      (void) f_close(&gnss_log_file);
+      (void) f_close(&baro_log_file);
+      (void) f_close(&imu_log_file);
+      return FR_DISK_ERR;
+    }
+  }
+  (void) f_lseek(&gnss_log_file, f_size(&gnss_log_file));
+
+  data_log_ready = 1U;
+  data_log_last_sync_tick = HAL_GetTick();
+  (void) f_sync(&imu_log_file);
+  (void) f_sync(&baro_log_file);
+  (void) f_sync(&gnss_log_file);
+  myprintf("SD logging started\r\n");
+  return FR_OK;
+}
+
+static void data_log_stop(void)
+{
+  if (data_log_ready == 0U)
+  {
+    return;
+  }
+
+  (void) f_sync(&imu_log_file);
+  (void) f_sync(&baro_log_file);
+  (void) f_sync(&gnss_log_file);
+  (void) f_close(&imu_log_file);
+  (void) f_close(&baro_log_file);
+  (void) f_close(&gnss_log_file);
+  (void) f_mount(NULL, USERPath, 0);
+  data_log_ready = 0U;
+  myprintf("SD logging stopped\r\n");
+}
+
 static void csv_log_imu_sample(const struct bmi2_sens_data *imu_sample,
-                               const gps_status_t *gps_sample,
+                               const gps_status_t *gps_snapshot,
                                uint32_t log_tick)
 {
-  SystemTime_t time_snapshot;
-  char system_time_buffer[20];
-  char acc_x_buffer[20];
-  char acc_y_buffer[20];
-  char acc_z_buffer[20];
-  char gyr_x_buffer[20];
-  char gyr_y_buffer[20];
-  char gyr_z_buffer[20];
-  const char *gps_utc;
   int32_t acc_x_x10000;
   int32_t acc_y_x10000;
   int32_t acc_z_x10000;
   int32_t gyr_x_x1000;
   int32_t gyr_y_x1000;
   int32_t gyr_z_x1000;
+  char acc_x_buffer[20];
+  char acc_y_buffer[20];
+  char acc_z_buffer[20];
+  char gyr_x_buffer[20];
+  char gyr_y_buffer[20];
+  char gyr_z_buffer[20];
+  const char *utc_text;
 
-  if ((data_log_ready == 0U) || (imu_sample == NULL) || (gps_sample == NULL))
+  if ((data_log_ready == 0U) || (imu_sample == NULL))
   {
     return;
   }
 
-  system_time_advance_to_tick(log_tick);
+  utc_text = (gps_snapshot != NULL) ? gps_snapshot->utc : "";
 
-  __disable_irq();
-  time_snapshot = system_time;
-  __enable_irq();
-
-  system_time_format(&time_snapshot, system_time_buffer, sizeof(system_time_buffer));
-  gps_utc = (gps_sample->valid != 0U) ? gps_sample->utc : "";
-
-  /* Fixed-point conversion avoids %f in FatFs f_printf, which is not supported. */
   acc_x_x10000 = div_round_s32((int64_t) imu_sample->acc.x * 10000LL, 2048);
   acc_y_x10000 = div_round_s32((int64_t) imu_sample->acc.y * 10000LL, 2048);
   acc_z_x10000 = div_round_s32((int64_t) imu_sample->acc.z * 10000LL, 2048);
@@ -652,9 +660,15 @@ static void csv_log_imu_sample(const struct bmi2_sens_data *imu_sample,
   format_fixed_decimal(gyr_z_buffer, sizeof(gyr_z_buffer), gyr_z_x1000, 1000U, 3U);
 
   (void) f_printf(&imu_log_file,
-                  "%s,%s,%s,%s,%s,%s,%s,%s\r\n",
-                  system_time_buffer,
-                  gps_utc,
+                  "%lu,%s,%d,%d,%d,%d,%d,%d,%s,%s,%s,%s,%s,%s\r\n",
+                  (unsigned long) log_tick,
+                  utc_text,
+                  (int) imu_sample->acc.x,
+                  (int) imu_sample->acc.y,
+                  (int) imu_sample->acc.z,
+                  (int) imu_sample->gyr.x,
+                  (int) imu_sample->gyr.y,
+                  (int) imu_sample->gyr.z,
                   acc_x_buffer,
                   acc_y_buffer,
                   acc_z_buffer,
@@ -664,95 +678,81 @@ static void csv_log_imu_sample(const struct bmi2_sens_data *imu_sample,
 }
 
 static void csv_log_baro_sample(const struct bmp3_data *baro_sample,
-                                const gps_status_t *gps_sample,
+                                const gps_status_t *gps_snapshot,
                                 uint32_t log_tick)
 {
-  SystemTime_t time_snapshot;
-  char system_time_buffer[20];
-  char temperature_buffer[20];
-  char pressure_buffer[20];
-  const char *gps_utc;
-  int32_t temperature_x100;
+  int32_t temp_x100;
   int32_t pressure_pa;
+  int32_t altitude_x100;
+  double pressure_ratio;
+  double altitude_m;
+  char temp_buffer[20];
+  char pressure_buffer[20];
+  char altitude_buffer[20];
+  const char *utc_text;
 
-  if ((data_log_ready == 0U) || (baro_sample == NULL) || (gps_sample == NULL))
+  if ((data_log_ready == 0U) || (baro_sample == NULL))
   {
     return;
   }
 
-  system_time_advance_to_tick(log_tick);
+  utc_text = (gps_snapshot != NULL) ? gps_snapshot->utc : "";
 
-  __disable_irq();
-  time_snapshot = system_time;
-  __enable_irq();
-
-  system_time_format(&time_snapshot, system_time_buffer, sizeof(system_time_buffer));
-  gps_utc = (gps_sample->valid != 0U) ? gps_sample->utc : "";
-  temperature_x100 = div_round_s32((int64_t) (baro_sample->temperature * 1000.0), 10);
+  temp_x100 = (int32_t) (baro_sample->temperature * 100.0);
   pressure_pa = (int32_t) (baro_sample->pressure);
+  pressure_ratio = baro_sample->pressure / SEA_LEVEL_PRESSURE_PA;
+  altitude_m = 44330.0 * (1.0 - pow(pressure_ratio, 0.19029495718));
+  altitude_x100 = (int32_t) (altitude_m * 100.0);
 
-  format_fixed_decimal(temperature_buffer, sizeof(temperature_buffer), temperature_x100, 100U, 2U);
+  format_fixed_decimal(temp_buffer, sizeof(temp_buffer), temp_x100, 100U, 2U);
   format_fixed_decimal(pressure_buffer, sizeof(pressure_buffer), pressure_pa, 1000U, 3U);
+  format_fixed_decimal(altitude_buffer, sizeof(altitude_buffer), altitude_x100, 100U, 2U);
 
   (void) f_printf(&baro_log_file,
-                  "%s,%s,%s,%s\r\n",
-                  system_time_buffer,
-                  gps_utc,
-                  temperature_buffer,
-                  pressure_buffer);
+                  "%lu,%s,%s,%s,%s\r\n",
+                  (unsigned long) log_tick,
+                  utc_text,
+                  temp_buffer,
+                  pressure_buffer,
+                  altitude_buffer);
 }
 
-static void csv_log_gps_sample(const gps_status_t *gps_sample,
-                               uint32_t log_tick)
+static void csv_log_gnss_sample(const gps_status_t *gps_snapshot,
+                                uint32_t log_tick)
 {
-  SystemTime_t time_snapshot;
-  char system_time_buffer[20];
-  char lat_buffer[24];
-  char lon_buffer[24];
-  char alt_buffer[20];
-  int32_t lat_x1e7;
-  int32_t lon_x1e7;
-  int32_t alt_x100;
+  char latitude_buffer[24];
+  char longitude_buffer[24];
+  char altitude_buffer[20];
 
-  if ((data_log_ready == 0U) || (gps_sample == NULL))
+  if ((data_log_ready == 0U) || (gps_snapshot == NULL) || (gps_snapshot->valid == 0U))
   {
     return;
   }
 
-  system_time_advance_to_tick(log_tick);
+  format_fixed_decimal(latitude_buffer,
+                       sizeof(latitude_buffer),
+                       (int32_t) (gps_snapshot->latitude_deg * 10000000.0),
+                       10000000U,
+                       7U);
+  format_fixed_decimal(longitude_buffer,
+                       sizeof(longitude_buffer),
+                       (int32_t) (gps_snapshot->longitude_deg * 10000000.0),
+                       10000000U,
+                       7U);
+  format_fixed_decimal(altitude_buffer,
+                       sizeof(altitude_buffer),
+                       (int32_t) (gps_snapshot->altitude_m * 100.0),
+                       100U,
+                       2U);
 
-  __disable_irq();
-  time_snapshot = system_time;
-  __enable_irq();
-
-  system_time_format(&time_snapshot, system_time_buffer, sizeof(system_time_buffer));
-
-  if (gps_sample->valid != 0U)
-  {
-    lat_x1e7 = div_round_s32((int64_t) (gps_sample->latitude_deg * 100000000.0), 10);
-    lon_x1e7 = div_round_s32((int64_t) (gps_sample->longitude_deg * 100000000.0), 10);
-    alt_x100 = div_round_s32((int64_t) (gps_sample->altitude_m * 1000.0), 10);
-
-    format_fixed_decimal(lat_buffer, sizeof(lat_buffer), lat_x1e7, 10000000U, 7U);
-    format_fixed_decimal(lon_buffer, sizeof(lon_buffer), lon_x1e7, 10000000U, 7U);
-    format_fixed_decimal(alt_buffer, sizeof(alt_buffer), alt_x100, 100U, 2U);
-
-    (void) f_printf(&gps_log_file,
-                    "%s,%s,%s,%s,%s,%u\r\n",
-                    system_time_buffer,
-                    gps_sample->utc,
-                    lat_buffer,
-                    lon_buffer,
-                    alt_buffer,
-                    (unsigned int) gps_sample->satellites);
-  }
-  else
-  {
-    (void) f_printf(&gps_log_file,
-                    "%s,,,,,%u\r\n",
-                    system_time_buffer,
-                    0U);
-  }
+  (void) f_printf(&gnss_log_file,
+                  "%lu,%s,%s,%s,%s,%u\r\n",
+                  (unsigned long) log_tick,
+                  gps_snapshot->utc,
+                  latitude_buffer,
+                  longitude_buffer,
+                  altitude_buffer,
+                  (unsigned int) gps_snapshot->satellites);
 }
 
 /* Start USART1 receive-to-idle on the circular GPS RX buffer. */
@@ -1811,6 +1811,38 @@ static int8_t bmp390_basic_init(void)
   return BMP3_OK;
 }
 
+/* Probe both BMI270 I2C addresses so board strap variants work without code edits. */
+static uint8_t bmi270_detect_address(uint8_t *found_addr)
+{
+  uint8_t chip_id;
+  HAL_StatusTypeDef status;
+  uint8_t i;
+  const uint8_t candidate_addrs[2] = { BMI2_I2C_PRIM_ADDR, BMI2_I2C_SEC_ADDR };
+
+  if (found_addr == NULL)
+  {
+    return 0U;
+  }
+
+  for (i = 0U; i < 2U; i++)
+  {
+    status = HAL_I2C_Mem_Read(&hi2c1,
+                              (uint16_t) (candidate_addrs[i] << 1U),
+                              BMI2_CHIP_ID_ADDR,
+                              I2C_MEMADD_SIZE_8BIT,
+                              &chip_id,
+                              1U,
+                              50U);
+    if ((status == HAL_OK) && (chip_id == BMI270_CHIP_ID))
+    {
+      *found_addr = candidate_addrs[i];
+      return 1U;
+    }
+  }
+
+  return 0U;
+}
+
 /* Full BMI270 setup: accel + gyro at 200Hz for athlete monitoring. */
 /* [OURS] This orchestration function is ours.
  * [DRIVER] Inside it, Bosch API calls are used as black-box operations.
@@ -1819,6 +1851,7 @@ static int8_t bmi270_basic_init(void)
 {
   /* Bosch return code variable (0 usually means success). */
   int8_t rslt;
+  uint8_t detected_addr;
   /* Config structures for both accel and gyro settings. */
   struct bmi2_sens_config accel_cfg;
   struct bmi2_sens_config gyro_cfg;
@@ -1829,8 +1862,15 @@ static int8_t bmi270_basic_init(void)
   // remember *hi2c in struct (ie pointer)
   // so this one is kind of our hardcoded variable
   bmi2_i2c_ctx.hi2c = &hi2c1;
-  /* Primary BMI270 I2C address (normally 0x68 depending on board jumper). */
-  bmi2_i2c_ctx.dev_addr = BMI2_I2C_PRIM_ADDR;
+
+  if (!bmi270_detect_address(&detected_addr))
+  {
+    printf("BMI270 not detected on hi2c1 (tried 0x68 and 0x69)\r\n");
+    return (int8_t) -2;
+  }
+
+  /* Store the detected 7-bit BMI270 I2C address. */
+  bmi2_i2c_ctx.dev_addr = detected_addr;
 
   /* Plug our callbacks/context into Bosch driver object. */
   /* [OURS] Assign callback pointers and context data. */
@@ -1925,7 +1965,9 @@ static int8_t bmi270_basic_init(void)
     return rslt;
   }
 
-  printf("BMI270 ready, chip id: 0x%02X\r\n", bmi_dev.chip_id);
+  printf("BMI270 ready, addr:0x%02X chip id: 0x%02X\r\n",
+         (unsigned int) detected_addr,
+         (unsigned int) bmi_dev.chip_id);
   /* Report success to caller. */
   return BMI2_OK;
 }
@@ -1969,12 +2011,94 @@ int main(void)
   MX_SPI2_Init();
   MX_FATFS_Init();
   /* USER CODE BEGIN 2 */
+  // myprintf("\r\n~ SD card demo by kiwih ~\r\n\r\n");
+
+  // HAL_Delay(1000); //a short delay is important to let the SD card settle
+
+  // //some variables for FatFs
+  // FATFS FatFs; 	//Fatfs handle
+  // FIL fil; 		//File handle
+  // FRESULT fres; //Result after operations
+
+  // //Open the file system
+  // fres = f_mount(&FatFs, "", 1); //1=mount now
+  // if (fres != FR_OK) {
+	// myprintf("f_mount error (%i)\r\n", fres);
+	// while(1);
+  // }
+
+  // //Let's get some statistics from the SD card
+  // DWORD free_clusters, free_sectors, total_sectors;
+
+  // FATFS* getFreeFs;
+
+  // fres = f_getfree("", &free_clusters, &getFreeFs);
+  // if (fres != FR_OK) {
+	// myprintf("f_getfree error (%i)\r\n", fres);
+	// while(1);
+  // }
+
+  // //Formula comes from ChaN's documentation
+  // total_sectors = (getFreeFs->n_fatent - 2) * getFreeFs->csize;
+  // free_sectors = free_clusters * getFreeFs->csize;
+
+  // myprintf("SD card stats:\r\n%10lu KiB total drive space.\r\n%10lu KiB available.\r\n", total_sectors / 2, free_sectors / 2);
+
+  // //Now let's try to open file "test.txt"
+  // fres = f_open(&fil, "test.txt", FA_READ);
+  // if (fres != FR_OK) {
+	// myprintf("f_open error (%i)\r\n", fres);
+	// while(1);
+  // }
+  // myprintf("I was able to open 'test.txt' for reading!\r\n");
+
+  // //Read 30 bytes from "test.txt" on the SD card
+  // BYTE readBuf[30];
+
+  // //We can either use f_read OR f_gets to get data out of files
+  // //f_gets is a wrapper on f_read that does some string formatting for us
+  // TCHAR* rres = f_gets((TCHAR*)readBuf, 30, &fil);
+  // if(rres != 0) {
+	// myprintf("Read string from 'test.txt' contents: %s\r\n", readBuf);
+  // } else {
+	// myprintf("f_gets error (%i)\r\n", fres);
+  // }
+
+  // //Be a tidy kiwi - don't forget to close your file!
+  // f_close(&fil);
+
+  // //Now let's try and write a file "write.txt"
+  // fres = f_open(&fil, "write.txt", FA_WRITE | FA_OPEN_ALWAYS | FA_CREATE_ALWAYS);
+  // if(fres == FR_OK) {
+	// myprintf("I was able to open 'write.txt' for writing\r\n");
+  // } else {
+	// myprintf("f_open error (%i)\r\n", fres);
+  // }
+
+  // //Copy in a string
+  // memcpy(readBuf, "a new file is made!", 19U);
+  // readBuf[19] = '\0';
+  // UINT bytesWrote;
+  // fres = f_write(&fil, readBuf, 19, &bytesWrote);
+  // if(fres == FR_OK) {
+	// myprintf("Wrote %i bytes to 'write.txt'!\r\n", bytesWrote);
+  // } else {
+	// myprintf("f_write error (%i)\r\n", fres);
+  // }
+
+  // //Be a tidy kiwi - don't forget to close your file!
+  // f_close(&fil);
+
+  // //We're done, so de-mount the drive
+  // f_mount(NULL, "", 0);
+
   /* STEP A: Initialize SEGGER RTT for debug output over SWD/ST-Link.
    * This must happen before any printf() calls.
    * RTT uses the debug connection (no UART needed for debug output).
    */
   SEGGER_RTT_Init();
 
+#if GPS_ENABLE != 0U
   /* Release GPS reset explicitly.
    * GPS_RESET is active-low on this hardware, so the module will stay off if this pin remains low.
    */
@@ -1988,6 +2112,7 @@ int main(void)
 
   /* Start GPS receive-to-idle on USART1 DMA before entering the main loop. */
   gps_uart_start_reception();
+#endif
 
   /* STEP D: first visible debug print. If you see this in RTT, CPU + debug link are alive. */
   printf("Booting...\r\n");
@@ -2026,6 +2151,7 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     /* TASK 0: consume PPS events in the main loop and discipline the system clock. */
+#if GPS_ENABLE != 0U
     if (gps_pps_sync_ready != 0U)
     {
       uint32_t pps_tick;
@@ -2037,16 +2163,12 @@ int main(void)
 
       system_time_handle_pps(pps_tick);
     }
+#endif
 
-    /* TASK 1: process button events captured by ISR. */
-    /* Button ISR sets button_event; main loop handles behavior change. */
-    /* [OURS] This whole control logic is yours to understand deeply. */
-    if (button_event)
+    /* TASK 1: toggle SD logging on button press. */
+    if (button_event != 0U)
     {
-      /* Consume the event once, then clear it.
-       * Event is set in EXTI callback after debounce.
-       */
-      button_event = 0;
+      button_event = 0U;
       if (logging_active == 0U)
       {
         if (data_log_start() == FR_OK)
@@ -2063,16 +2185,11 @@ int main(void)
     }
 
     /* TASK 2: blink LED only while logging is active. */
-    /* Non-blocking blink task: only active while SD logging is enabled. */
-    /* [OURS] Timing/state pattern is yours. */
+    uint32_t now = HAL_GetTick();
     if (logging_active != 0U)
     {
-      /* Read current time once per iteration for this task. */
-      uint32_t now = HAL_GetTick();
-      /* If 200 ms elapsed, perform one toggle action. */
-      if ((now - last_blink_tick) >= 200U)
+      if ((now - last_blink_tick) >= LOG_LED_BLINK_MS)
       {
-        /* Save timestamp before toggle so interval stays stable over time. */
         last_blink_tick = now;
         HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
       }
@@ -2092,8 +2209,8 @@ int main(void)
     {
       /* Local result variable for this transaction. */
       int8_t rslt;
-      uint32_t log_tick;
       gps_status_t gps_snapshot;
+      uint32_t log_tick;
 
       /* Same timing pattern as blink task: do work only when period elapsed. */
       log_tick = HAL_GetTick();
@@ -2121,6 +2238,8 @@ int main(void)
           (int) bmi_sens_data.gyr.x,
           (int) bmi_sens_data.gyr.y,
           (int) bmi_sens_data.gyr.z);
+        gps_copy_status_snapshot(&gps_snapshot);
+        csv_log_imu_sample(&bmi_sens_data, &gps_snapshot, log_tick);
       }
       else
       {
@@ -2129,16 +2248,14 @@ int main(void)
         printf("BMI270 read failed: %d\r\n", rslt);
       }
 
-      gps_copy_status_snapshot(&gps_snapshot);
-      csv_log_imu_sample(&bmi_sens_data, &gps_snapshot, log_tick);
     }
 
     /* TASK 4: periodically read BMP390 pressure+temperature. */
     if ((HAL_GetTick() - last_baro_tick) >= BARO_VISUAL_REFRESH_MS)
     {
       int8_t rslt;
-      uint32_t log_tick;
       gps_status_t gps_snapshot;
+      uint32_t log_tick;
 
       log_tick = HAL_GetTick();
       last_baro_tick = log_tick;
@@ -2162,25 +2279,25 @@ int main(void)
       }
     }
 
-    /* TASK 5: log GPS data to file at 1 Hz, independent of IMU/baro rates. */
-    if ((HAL_GetTick() - last_gps_log_tick) >= GPS_LOG_REFRESH_MS)
+    /* TASK 4b: log the latest valid GNSS fix once per second. */
+    if ((data_log_ready != 0U) && ((HAL_GetTick() - last_gps_log_tick) >= GPS_LOG_REFRESH_MS))
     {
-      uint32_t log_tick;
       gps_status_t gps_snapshot;
+      uint32_t log_tick;
 
       log_tick = HAL_GetTick();
       last_gps_log_tick = log_tick;
       gps_copy_status_snapshot(&gps_snapshot);
-      csv_log_gps_sample(&gps_snapshot, log_tick);
+      csv_log_gnss_sample(&gps_snapshot, log_tick);
     }
 
-    /* TASK 5b: perform periodic SD sync in one place to avoid clustered blocking writes. */
+    /* TASK 5: periodic SD sync to reduce data loss on power drop. */
     if ((data_log_ready != 0U) && ((HAL_GetTick() - data_log_last_sync_tick) >= DATA_LOG_SYNC_MS))
     {
       data_log_last_sync_tick = HAL_GetTick();
       (void) f_sync(&imu_log_file);
       (void) f_sync(&baro_log_file);
-      (void) f_sync(&gps_log_file);
+      (void) f_sync(&gnss_log_file);
     }
 
     /* TASK 6: print low-rate sensor health summary once per second. */
@@ -2214,8 +2331,10 @@ int main(void)
     }
 
     /* TASK 7: publish the latest GPS status line when a new GGA sentence has been parsed. */
+#if GPS_ENABLE != 0U
     gps_uart_poll_dma();
     gps_emit_status();
+#endif
   }
   /* USER CODE END 3 */
 }
@@ -2388,7 +2507,7 @@ static void MX_SPI2_Init(void)
   hspi2.Init.CLKPolarity = SPI_POLARITY_LOW;
   hspi2.Init.CLKPhase = SPI_PHASE_1EDGE;
   hspi2.Init.NSS = SPI_NSS_SOFT;
-  hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_32;
+  hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_256;
   hspi2.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi2.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi2.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
@@ -2510,7 +2629,7 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOC, GPS_EINT_Pin|GPS_RST_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOC, GPS_EINT_o_Pin|SD_BTN_Pin|GPS_RST_Pin|GPS_EINT_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
@@ -2524,14 +2643,14 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(Button_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : GPS_PPS_Pin */
-  GPIO_InitStruct.Pin = GPS_PPS_Pin;
+  /*Configure GPIO pin : GPS_PPS_o_Pin */
+  GPIO_InitStruct.Pin = GPS_PPS_o_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(GPS_PPS_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPS_PPS_o_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : GPS_EINT_Pin GPS_RST_Pin SD_CS_Pin */
-  GPIO_InitStruct.Pin = GPS_EINT_Pin|GPS_RST_Pin|SD_CS_Pin;
+  /*Configure GPIO pins : GPS_EINT_o_Pin SD_BTN_Pin GPS_RST_Pin GPS_EINT_Pin */
+  GPIO_InitStruct.Pin = GPS_EINT_o_Pin|SD_BTN_Pin|GPS_RST_Pin|GPS_EINT_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
@@ -2544,9 +2663,31 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(LD2_GPIO_Port, &GPIO_InitStruct);
 
+  /*Configure GPIO pin : SD_CS_Pin */
+  GPIO_InitStruct.Pin = SD_CS_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(SD_CS_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : GPS_PPS_Pin */
+  GPIO_InitStruct.Pin = GPS_PPS_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPS_PPS_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : BMI_INT1_Pin */
+  GPIO_InitStruct.Pin = BMI_INT1_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(BMI_INT1_GPIO_Port, &GPIO_InitStruct);
+
   /* EXTI interrupt init*/
   HAL_NVIC_SetPriority(EXTI0_IRQn, 1, 0);
   HAL_NVIC_EnableIRQ(EXTI0_IRQn);
+
+  HAL_NVIC_SetPriority(EXTI9_5_IRQn, 1, 0);
+  HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
 
   HAL_NVIC_SetPriority(EXTI15_10_IRQn, 3, 0);
   HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
@@ -2566,10 +2707,14 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
     return;
   }
 
+#if GPS_ENABLE != 0U
   if (huart->Instance == USART1)
   {
     gps_uart_process_dma_chunk(Size);
   }
+#else
+  (void) Size;
+#endif
 }
 
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
@@ -2583,7 +2728,9 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
   {
     gps_uart_error_code = huart->ErrorCode;
     SEGGER_RTT_printf("GPSDBG|UART error: 0x%08lX\r\n", (unsigned long) huart->ErrorCode);
+#if GPS_ENABLE != 0U
     gps_uart_start_reception();
+#endif
   }
 }
 
@@ -2607,6 +2754,7 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
       button_event = 1;
     }
   }
+#if GPS_ENABLE != 0U
   else if (GPIO_Pin == GPS_PPS_Pin)
   {
     /* Capture a high-resolution synchronization point for GPS/IMU drift correction. */
@@ -2614,6 +2762,7 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
     gps_pps_tick_stamp = HAL_GetTick();
     gps_pps_sync_ready = 1U;
   }
+#endif
 }
 
 /* USER CODE END 4 */

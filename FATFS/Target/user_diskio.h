@@ -29,16 +29,10 @@
 /* USER CODE BEGIN 0 */
 
 /* Includes ------------------------------------------------------------------*/
-#include <stdint.h>
 /* Exported types ------------------------------------------------------------*/
 /* Exported constants --------------------------------------------------------*/
 /* Exported functions ------------------------------------------------------- */
 extern Diskio_drvTypeDef  USER_Driver;
-uint8_t USER_SD_GetDiagStage(void);
-uint8_t USER_SD_GetDiagLastCmd(void);
-uint8_t USER_SD_GetDiagLastR1(void);
-uint8_t USER_SD_GetDiagLastToken(void);
-uint8_t USER_SD_GetCardType(void);
 
 /* USER CODE END 0 */
 

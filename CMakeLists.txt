@@ -45,6 +45,7 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 # Add sources to executable
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
+    FATFS/Target/user_diskio_spi.c
     third_party/BMI270_SensorAPI/bmi2.c
     third_party/BMI270_SensorAPI/bmi270.c
     third_party/BMP3_SensorAPI/bmp3.c
