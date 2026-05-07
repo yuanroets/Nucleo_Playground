@@ -51,7 +51,7 @@
 /* GPS logging cadence (1 Hz) for dedicated GPS data file. */
 #define GPS_LOG_REFRESH_MS 1000U
 /* Set to 0 to keep the GPS code compiled in but fully inactive. */
-#define GPS_ENABLE 0U
+#define GPS_ENABLE 1U
 /* Flush all open CSV files from one central task in the main loop. */
 #define DATA_LOG_SYNC_MS 2000U
 /* Never block forever on I2C transfers; fail fast and recover next cycle. */
@@ -1275,7 +1275,8 @@ static void gps_uart_report_debug(void)
                     (unsigned int) last_chunk_size,
                     (unsigned long) cndtr,
                     (unsigned long) usart_isr,
-                    (unsigned long) error_code);
+                    (unsigned long) error_code,
+                    (unsigned int) last_line_length);
 
 #if GPS_EXTENSIVE_DEBUG
   if (gps_uart_last_line_length > 0U)
@@ -2099,6 +2100,10 @@ int main(void)
   SEGGER_RTT_Init();
 
 #if GPS_ENABLE != 0U
+  /* Keep module control lines in safe idle states before starting UART RX. */
+  HAL_GPIO_WritePin(GPS_EINT_o_GPIO_Port, GPS_EINT_o_Pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(GPS_EINT_GPIO_Port, GPS_EINT_Pin, GPIO_PIN_SET);
+
   /* Release GPS reset explicitly.
    * GPS_RESET is active-low on this hardware, so the module will stay off if this pin remains low.
    */
@@ -2693,6 +2698,12 @@ static void MX_GPIO_Init(void)
   HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
+  /* Legacy PPS pin (PC0) is no longer used; neutralize it after CubeMX init. */
+  GPIO_InitStruct.Pin = GPS_PPS_o_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPS_PPS_o_GPIO_Port, &GPIO_InitStruct);
+  HAL_NVIC_DisableIRQ(EXTI0_IRQn);
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
